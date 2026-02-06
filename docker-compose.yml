@@ -1,0 +1,18 @@
+services:
+  primal-pds:
+    build: .
+    image: primal-pds
+    container_name: primal-pds
+    restart: unless-stopped
+    volumes:
+      - ./db.json:/app/db.json:ro
+      - ${TRAEFIK_DYNAMIC_DIR:?Set TRAEFIK_DYNAMIC_DIR in .env}:/traefik-dynamic
+    networks:
+      - atproto
+      - infra
+
+networks:
+  atproto:
+    external: true
+  infra:
+    external: true

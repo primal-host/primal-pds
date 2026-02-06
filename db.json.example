@@ -1,0 +1,9 @@
+{
+  "dbConn": "infra-postgres:5432",
+  "dbName": "primal_pds",
+  "dbUser": "dba_primal_pds",
+  "dbPass": "change-me",
+  "listenAddr": ":3000",
+  "traefikConfigDir": "/traefik-dynamic",
+  "adminKey": "change-me"
+}

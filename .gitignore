@@ -1,0 +1,11 @@
+# Binary
+primal-pds
+
+# Config with secrets
+db.json
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
