@@ -1,5 +1,5 @@
-# Binary
-primal-pds
+# Binary (root only, not cmd/primal-pds/ directory)
+/primal-pds
 
 # Config with secrets
 db.json
