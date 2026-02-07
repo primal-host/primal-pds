@@ -4,7 +4,7 @@
 package repo
 
 import (
-	"github.com/bluesky-social/indigo/atproto/data"
+	"github.com/bluesky-social/indigo/atproto/atdata"
 
 	"github.com/ipfs/go-cid"
 	"github.com/multiformats/go-multihash"
@@ -14,13 +14,13 @@ import (
 // The input should already be in the atproto data model (i.e., parsed
 // through data.UnmarshalJSON).
 func EncodeRecord(record map[string]any) ([]byte, error) {
-	return data.MarshalCBOR(record)
+	return atdata.MarshalCBOR(record)
 }
 
 // DecodeRecord converts DAG-CBOR bytes back to an atproto data map
 // suitable for JSON serialization.
 func DecodeRecord(cborBytes []byte) (map[string]any, error) {
-	return data.UnmarshalCBOR(cborBytes)
+	return atdata.UnmarshalCBOR(cborBytes)
 }
 
 // ComputeCID returns a CIDv1 (SHA-256, DAG-CBOR codec) for raw bytes.

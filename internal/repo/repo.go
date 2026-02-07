@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bluesky-social/indigo/atproto/data"
+	"github.com/bluesky-social/indigo/atproto/atcrypto"
+	"github.com/bluesky-social/indigo/atproto/atdata"
 	indigorepo "github.com/bluesky-social/indigo/atproto/repo"
 	"github.com/bluesky-social/indigo/atproto/repo/mst"
 	"github.com/bluesky-social/indigo/atproto/syntax"
@@ -183,7 +184,7 @@ func (m *Manager) PutRecord(ctx context.Context, did, signingKey, collection, rk
 	if err != nil {
 		return "", "", "", fmt.Errorf("repo: put marshal json: %w", err)
 	}
-	parsed, err := data.UnmarshalJSON(rawJSON)
+	parsed, err := atdata.UnmarshalJSON(rawJSON)
 	if err != nil {
 		return "", "", "", fmt.Errorf("repo: put parse record: %w", err)
 	}
@@ -380,7 +381,7 @@ func (m *Manager) openRepo(ctx context.Context, did string) (*MemBlockstore, mst
 }
 
 // commitRepo signs a new commit, writes MST blocks, and persists to Postgres.
-func (m *Manager) commitRepo(ctx context.Context, did string, privKey interface{ HashAndSign([]byte) ([]byte, error) }, bs *MemBlockstore, tree *mst.Tree, prevRoot *repoRoot) (commitCIDStr, rev string, err error) {
+func (m *Manager) commitRepo(ctx context.Context, did string, privKey atcrypto.PrivateKey, bs *MemBlockstore, tree *mst.Tree, prevRoot *repoRoot) (commitCIDStr, rev string, err error) {
 	// Write dirty MST nodes to blockstore.
 	mstRoot, err := tree.WriteDiffBlocks(ctx, bs)
 	if err != nil {
