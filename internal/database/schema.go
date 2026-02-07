@@ -25,6 +25,18 @@ CREATE TABLE IF NOT EXISTS did_routing (
     did     VARCHAR(255) PRIMARY KEY,
     domain  VARCHAR(253) NOT NULL REFERENCES domains(domain) ON DELETE CASCADE
 );
+
+-- firehose_events: Sequenced event log for the com.atproto.sync.subscribeRepos
+-- firehose. Each row is a CBOR-encoded commit event. The BIGSERIAL seq column
+-- provides a monotonically increasing cursor for replay.
+CREATE TABLE IF NOT EXISTS firehose_events (
+    seq        BIGSERIAL PRIMARY KEY,
+    event_type VARCHAR(20) NOT NULL,
+    did        VARCHAR(255) NOT NULL,
+    payload    BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_firehose_events_seq ON firehose_events(seq);
 `
 
 // TenantSchema contains the SQL statements for per-domain tenant databases.
