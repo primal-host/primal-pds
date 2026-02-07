@@ -95,3 +95,13 @@ func (c *Config) ConnString() string {
 		url.QueryEscape(c.DBName),
 	)
 }
+
+// ConnBase returns a connection string template without a database name.
+// Used by PoolManager to construct per-tenant connection strings.
+func (c *Config) ConnBase() string {
+	return fmt.Sprintf("postgres://%s:%s@%s",
+		url.QueryEscape(c.DBUser),
+		url.QueryEscape(c.DBPass),
+		c.DBConn,
+	)
+}
