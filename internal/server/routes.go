@@ -215,9 +215,10 @@ func (s *Server) handleAddDomain(c echo.Context) error {
 	}
 
 	adminAcct, err := accounts.Create(ctx, account.CreateParams{
-		Handle:   req.Domain,
-		Password: adminPass,
-		Role:     account.RoleOwner,
+		Handle:          req.Domain,
+		Password:        adminPass,
+		Role:            account.RoleOwner,
+		ServiceEndpoint: s.serviceEndpointForDomain(req.Domain),
 	})
 	if err != nil {
 		log.Printf("Error creating admin account for domain %q: %v", req.Domain, err)
@@ -476,10 +477,11 @@ func (s *Server) handleCreateAccount(c echo.Context) error {
 	}
 
 	acct, err := accounts.Create(ctx, account.CreateParams{
-		Handle:   fullHandle,
-		Email:    req.Email,
-		Password: password,
-		Role:     req.Role,
+		Handle:          fullHandle,
+		Email:           req.Email,
+		Password:        password,
+		Role:            req.Role,
+		ServiceEndpoint: s.serviceEndpointForDomain(req.Domain),
 	})
 	if err != nil {
 		if isDuplicateKey(err) {
@@ -795,6 +797,15 @@ func (s *Server) handleDeleteAccount(c echo.Context) error {
 // =====================================================================
 // Helpers
 // =====================================================================
+
+// serviceEndpointForDomain returns the HTTPS service endpoint URL for a
+// domain when PLCEndpoint is configured. Empty string means use random DIDs.
+func (s *Server) serviceEndpointForDomain(domainName string) string {
+	if s.cfg.PLCEndpoint == "" {
+		return ""
+	}
+	return "https://" + domainName
+}
 
 // refreshTraefik regenerates the Traefik dynamic config file.
 func (s *Server) refreshTraefik(c echo.Context) {

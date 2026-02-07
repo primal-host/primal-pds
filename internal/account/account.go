@@ -63,10 +63,11 @@ type Account struct {
 
 // CreateParams holds the parameters for creating a new account.
 type CreateParams struct {
-	Handle   string
-	Email    string
-	Password string // plaintext, will be hashed
-	Role     string // defaults to "user" if empty
+	Handle          string
+	Email           string
+	Password        string // plaintext, will be hashed
+	Role            string // defaults to "user" if empty
+	ServiceEndpoint string // when set, derive proper did:plc from signing key
 }
 
 // Store provides account CRUD operations backed by PostgreSQL.
@@ -82,12 +83,10 @@ func NewStore(db *database.DB) *Store {
 // Create inserts a new account. It generates a DID, hashes the password,
 // and stores the account. Returns the created Account (password excluded)
 // and the plaintext password if it was auto-generated.
+//
+// When ServiceEndpoint is set, a proper did:plc is derived from the
+// signing key. Otherwise a random DID is generated.
 func (s *Store) Create(ctx context.Context, p CreateParams) (*Account, error) {
-	did, err := GenerateDID()
-	if err != nil {
-		return nil, fmt.Errorf("account: create: %w", err)
-	}
-
 	hash, err := HashPassword(p.Password)
 	if err != nil {
 		return nil, fmt.Errorf("account: create: %w", err)
@@ -96,6 +95,20 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Account, error) {
 	signingKey, err := repo.GenerateKey()
 	if err != nil {
 		return nil, fmt.Errorf("account: create signing key: %w", err)
+	}
+
+	// Generate DID — either proper PLC or random.
+	var did string
+	if p.ServiceEndpoint != "" {
+		did, _, err = GeneratePLCDID(signingKey, p.Handle, p.ServiceEndpoint)
+		if err != nil {
+			return nil, fmt.Errorf("account: create plc did: %w", err)
+		}
+	} else {
+		did, err = GenerateDID()
+		if err != nil {
+			return nil, fmt.Errorf("account: create: %w", err)
+		}
 	}
 
 	role := p.Role

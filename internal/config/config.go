@@ -39,6 +39,11 @@ type Config struct {
 	// AdminKey is a shared secret for authenticating management API calls.
 	// Clients send it as "Authorization: Bearer <adminKey>".
 	AdminKey string `json:"adminKey"`
+
+	// PLCEndpoint is the PLC directory URL (e.g., "https://plc.directory").
+	// When set, new accounts get proper did:plc DIDs derived from their
+	// signing key. When empty, random DIDs are generated (local-only).
+	PLCEndpoint string `json:"plcEndpoint,omitempty"`
 }
 
 // Load reads and parses configuration from the given file path.
