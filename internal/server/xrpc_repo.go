@@ -1,15 +1,21 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	"github.com/primal-host/primal-pds/internal/account"
+	"github.com/primal-host/primal-pds/internal/events"
+	"github.com/primal-host/primal-pds/internal/repo"
+
+	"github.com/ipfs/go-cid"
 )
 
 // resolveRepo resolves a "repo" parameter (handle or DID) to an Account
@@ -99,12 +105,13 @@ func (s *Server) handleCreateRecord(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
-	var uri, cidStr, rev string
+	var uri string
+	var result *repo.CommitResult
 
 	if req.RKey != "" {
-		uri, cidStr, rev, err = s.repos.PutRecord(ctx, pool, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
+		uri, result, err = s.repos.PutRecord(ctx, pool, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
 	} else {
-		uri, cidStr, rev, err = s.repos.CreateRecord(ctx, pool, acct.DID, acct.SigningKey, req.Collection, req.Record)
+		uri, result, err = s.repos.CreateRecord(ctx, pool, acct.DID, acct.SigningKey, req.Collection, req.Record)
 	}
 	if err != nil {
 		log.Printf("Error creating record for %s: %v", acct.DID, err)
@@ -114,12 +121,14 @@ func (s *Server) handleCreateRecord(c echo.Context) error {
 		})
 	}
 
+	s.emitCommitEvent(ctx, acct.DID, result)
+
 	return c.JSON(http.StatusOK, map[string]any{
 		"uri": uri,
-		"cid": cidStr,
+		"cid": result.CommitCID,
 		"commit": map[string]string{
-			"cid": cidStr,
-			"rev": rev,
+			"cid": result.CommitCID,
+			"rev": result.Rev,
 		},
 	})
 }
@@ -209,7 +218,7 @@ func (s *Server) handleDeleteRecord(c echo.Context) error {
 		})
 	}
 
-	rev, err := s.repos.DeleteRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey)
+	result, err := s.repos.DeleteRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return c.JSON(http.StatusNotFound, map[string]string{
@@ -224,16 +233,12 @@ func (s *Server) handleDeleteRecord(c echo.Context) error {
 		})
 	}
 
-	// Get updated commit CID.
-	commitCID, _, err := s.repos.GetRoot(c.Request().Context(), pool, acct.DID)
-	if err != nil {
-		commitCID = ""
-	}
+	s.emitCommitEvent(c.Request().Context(), acct.DID, result)
 
 	return c.JSON(http.StatusOK, map[string]any{
 		"commit": map[string]string{
-			"cid": commitCID,
-			"rev": rev,
+			"cid": result.CommitCID,
+			"rev": result.Rev,
 		},
 	})
 }
@@ -275,7 +280,7 @@ func (s *Server) handlePutRecord(c echo.Context) error {
 		})
 	}
 
-	uri, cidStr, rev, err := s.repos.PutRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
+	uri, result, err := s.repos.PutRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
 	if err != nil {
 		log.Printf("Error putting record %s/%s for %s: %v", req.Collection, req.RKey, acct.DID, err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{
@@ -284,12 +289,14 @@ func (s *Server) handlePutRecord(c echo.Context) error {
 		})
 	}
 
+	s.emitCommitEvent(c.Request().Context(), acct.DID, result)
+
 	return c.JSON(http.StatusOK, map[string]any{
 		"uri": uri,
-		"cid": cidStr,
+		"cid": result.CommitCID,
 		"commit": map[string]string{
-			"cid": cidStr,
-			"rev": rev,
+			"cid": result.CommitCID,
+			"rev": result.Rev,
 		},
 	})
 }
@@ -379,11 +386,69 @@ func (s *Server) handleDescribeRepo(c echo.Context) error {
 		})
 	}
 
+	// Extract domain from handle to build DID document.
+	domainName := extractDomainFromHandle(acct.Handle, s.pools)
+	didDoc := map[string]any{}
+	if domainName != "" && acct.SigningKey != "" {
+		doc, err := account.BuildDIDDocument(acct.DID, acct.Handle, acct.SigningKey, domainName)
+		if err == nil {
+			didDoc = map[string]any{
+				"@context":           doc.Context,
+				"id":                 doc.ID,
+				"alsoKnownAs":       doc.AlsoKnownAs,
+				"verificationMethod": doc.VerificationMethod,
+				"service":            doc.Service,
+			}
+		} else {
+			log.Printf("Warning: failed to build DID doc for %s: %v", acct.DID, err)
+		}
+	}
+
 	return c.JSON(http.StatusOK, map[string]any{
 		"handle":          acct.Handle,
 		"did":             acct.DID,
-		"didDoc":          map[string]any{},
+		"didDoc":          didDoc,
 		"collections":     collections,
 		"handleIsCorrect": true,
 	})
+}
+
+// emitCommitEvent converts a CommitResult to a CommitInfo and emits it
+// through the EventManager. Errors are logged but not returned — event
+// emission is best-effort and must not break the mutation path.
+func (s *Server) emitCommitEvent(ctx context.Context, did string, result *repo.CommitResult) {
+	if s.events == nil || result == nil {
+		return
+	}
+
+	commitCID, err := cid.Decode(result.CommitCID)
+	if err != nil {
+		log.Printf("Warning: emit event: decode commit cid: %v", err)
+		return
+	}
+
+	ops := make([]events.OpInfo, len(result.Ops))
+	for i, op := range result.Ops {
+		ops[i] = events.OpInfo{
+			Action: op.Action,
+			Path:   op.Path,
+			CID:    op.CID,
+			Prev:   op.Prev,
+		}
+	}
+
+	info := &events.CommitInfo{
+		DID:       did,
+		Rev:       result.Rev,
+		PrevRev:   result.PrevRev,
+		CommitCID: commitCID.String(),
+		PrevData:  result.PrevData,
+		DiffCAR:   result.DiffCAR,
+		Ops:       ops,
+		Time:      time.Now(),
+	}
+
+	if err := s.events.Emit(ctx, info); err != nil {
+		log.Printf("Warning: emit event for %s: %v", did, err)
+	}
 }

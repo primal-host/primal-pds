@@ -23,6 +23,7 @@ import (
 	"github.com/primal-host/primal-pds/internal/config"
 	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
+	"github.com/primal-host/primal-pds/internal/events"
 	"github.com/primal-host/primal-pds/internal/repo"
 	"github.com/primal-host/primal-pds/internal/server"
 )
@@ -112,8 +113,14 @@ func main() {
 		log.Printf("Traefik config written to %s", cfg.TraefikConfigDir)
 	}
 
+	// Initialize event manager for firehose.
+	persister := events.NewPersister(mgmtDB.Pool)
+	evtMgr := events.NewManager(persister)
+	defer evtMgr.Shutdown()
+	log.Println("Event manager initialized")
+
 	// Start the HTTP server (blocks until context is cancelled).
-	srv := server.New(cfg, mgmtDB, pools, domains, repos)
+	srv := server.New(cfg, mgmtDB, pools, domains, repos, evtMgr)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}

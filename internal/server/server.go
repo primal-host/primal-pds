@@ -13,6 +13,7 @@ import (
 	"github.com/primal-host/primal-pds/internal/config"
 	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
+	"github.com/primal-host/primal-pds/internal/events"
 	"github.com/primal-host/primal-pds/internal/repo"
 )
 
@@ -24,10 +25,11 @@ type Server struct {
 	pools   *database.PoolManager
 	domains *domain.Store
 	repos   *repo.Manager
+	events  *events.Manager
 }
 
 // New creates a configured Echo server with all routes registered.
-func New(cfg *config.Config, mgmtDB *database.ManagementDB, pools *database.PoolManager, domains *domain.Store, repos *repo.Manager) *Server {
+func New(cfg *config.Config, mgmtDB *database.ManagementDB, pools *database.PoolManager, domains *domain.Store, repos *repo.Manager, evts *events.Manager) *Server {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true // We log the listen address ourselves.
@@ -42,6 +44,7 @@ func New(cfg *config.Config, mgmtDB *database.ManagementDB, pools *database.Pool
 		pools:   pools,
 		domains: domains,
 		repos:   repos,
+		events:  evts,
 	}
 
 	s.registerRoutes()

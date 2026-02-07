@@ -42,6 +42,25 @@ type repoRoot struct {
 	Rev       string
 }
 
+// CommitResult captures everything about a commit that downstream
+// consumers (like the firehose) need to build event payloads.
+type CommitResult struct {
+	CommitCID string
+	Rev       string
+	PrevRev   string
+	PrevData  *cid.Cid
+	Ops       []RepoOp
+	DiffCAR   []byte // CAR v1 with only new blocks
+}
+
+// RepoOp describes a single record mutation within a commit.
+type RepoOp struct {
+	Action string   // "create", "update", or "delete"
+	Path   string   // collection/rkey
+	CID    *cid.Cid // new record CID (nil for delete)
+	Prev   *cid.Cid // previous record CID (nil for create)
+}
+
 // InitRepo creates an empty repository for a new account. It creates
 // an empty MST, signs an initial commit, and persists the blocks.
 // Safe to call multiple times — returns nil if a root already exists.
@@ -106,7 +125,7 @@ func (m *Manager) InitRepo(ctx context.Context, pool *pgxpool.Pool, did, signing
 
 // CreateRecord adds a record to an account's repository. It generates
 // a TID rkey, inserts into the MST, and creates a signed commit.
-func (m *Manager) CreateRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection string, record map[string]any) (uri, cidStr, rev string, err error) {
+func (m *Manager) CreateRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection string, record map[string]any) (uri string, result *CommitResult, err error) {
 	clock := syntax.NewTIDClock(0)
 	rkey := clock.Next().String()
 	return m.PutRecord(ctx, pool, did, signingKey, collection, rkey, record)
@@ -142,91 +161,107 @@ func (m *Manager) GetRecord(ctx context.Context, pool *pgxpool.Pool, did, collec
 }
 
 // DeleteRecord removes a record from the repo.
-func (m *Manager) DeleteRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection, rkey string) (rev string, err error) {
+func (m *Manager) DeleteRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection, rkey string) (*CommitResult, error) {
 	privKey, err := ParseKey(signingKey)
 	if err != nil {
-		return "", fmt.Errorf("repo: delete: %w", err)
+		return nil, fmt.Errorf("repo: delete: %w", err)
 	}
 
-	bs, tree, root, err := openRepo(ctx, pool, did)
+	tbs, tree, root, err := openRepo(ctx, pool, did)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	path := collection + "/" + rkey
 	prev, err := tree.Remove([]byte(path))
 	if err != nil {
-		return "", fmt.Errorf("repo: delete mst remove: %w", err)
+		return nil, fmt.Errorf("repo: delete mst remove: %w", err)
 	}
 	if prev == nil {
-		return "", fmt.Errorf("repo: record not found: %s", path)
+		return nil, fmt.Errorf("repo: record not found: %s", path)
 	}
 
-	commitCIDStr, newRev, err := commitRepo(ctx, pool, did, privKey, bs, &tree, root)
+	ops := []RepoOp{{
+		Action: "delete",
+		Path:   path,
+		CID:    nil,
+		Prev:   prev,
+	}}
+
+	result, err := commitRepo(ctx, pool, did, privKey, tbs, &tree, root, ops)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	_ = commitCIDStr
-
-	return newRev, nil
+	return result, nil
 }
 
 // PutRecord creates or updates a record at a specific rkey.
-func (m *Manager) PutRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection, rkey string, record map[string]any) (uri, cidStr, rev string, err error) {
+func (m *Manager) PutRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection, rkey string, record map[string]any) (uri string, result *CommitResult, err error) {
 	privKey, err := ParseKey(signingKey)
 	if err != nil {
-		return "", "", "", fmt.Errorf("repo: put: %w", err)
+		return "", nil, fmt.Errorf("repo: put: %w", err)
 	}
 
 	// Parse the JSON record through the atproto data model.
 	rawJSON, err := json.Marshal(record)
 	if err != nil {
-		return "", "", "", fmt.Errorf("repo: put marshal json: %w", err)
+		return "", nil, fmt.Errorf("repo: put marshal json: %w", err)
 	}
 	parsed, err := atdata.UnmarshalJSON(rawJSON)
 	if err != nil {
-		return "", "", "", fmt.Errorf("repo: put parse record: %w", err)
+		return "", nil, fmt.Errorf("repo: put parse record: %w", err)
 	}
 
 	// Encode record as DAG-CBOR.
 	cborBytes, err := EncodeRecord(parsed)
 	if err != nil {
-		return "", "", "", fmt.Errorf("repo: put encode: %w", err)
+		return "", nil, fmt.Errorf("repo: put encode: %w", err)
 	}
 
 	recordCID, err := ComputeCID(cborBytes)
 	if err != nil {
-		return "", "", "", fmt.Errorf("repo: put cid: %w", err)
+		return "", nil, fmt.Errorf("repo: put cid: %w", err)
 	}
 
-	bs, tree, root, err := openRepo(ctx, pool, did)
+	tbs, tree, root, err := openRepo(ctx, pool, did)
 	if err != nil {
-		return "", "", "", err
+		return "", nil, err
 	}
 
 	// Store the record block.
 	blk, err := blocks.NewBlockWithCid(cborBytes, recordCID)
 	if err != nil {
-		return "", "", "", fmt.Errorf("repo: put create block: %w", err)
+		return "", nil, fmt.Errorf("repo: put create block: %w", err)
 	}
-	if err := bs.Put(ctx, blk); err != nil {
-		return "", "", "", fmt.Errorf("repo: put store block: %w", err)
+	if err := tbs.Put(ctx, blk); err != nil {
+		return "", nil, fmt.Errorf("repo: put store block: %w", err)
 	}
 
-	// Insert into MST.
+	// Insert into MST. prev is non-nil if this is an update.
 	path := collection + "/" + rkey
-	if _, err := tree.Insert([]byte(path), recordCID); err != nil {
-		return "", "", "", fmt.Errorf("repo: put mst insert: %w", err)
+	prev, err := tree.Insert([]byte(path), recordCID)
+	if err != nil {
+		return "", nil, fmt.Errorf("repo: put mst insert: %w", err)
 	}
 
-	commitCIDStr, newRev, err := commitRepo(ctx, pool, did, privKey, bs, &tree, root)
-	if err != nil {
-		return "", "", "", err
+	action := "create"
+	if prev != nil {
+		action = "update"
 	}
-	_ = commitCIDStr
+	ops := []RepoOp{{
+		Action: action,
+		Path:   path,
+		CID:    &recordCID,
+		Prev:   prev,
+	}}
+
+	result, err = commitRepo(ctx, pool, did, privKey, tbs, &tree, root, ops)
+	if err != nil {
+		return "", nil, err
+	}
 
 	atURI := "at://" + did + "/" + collection + "/" + rkey
-	return atURI, recordCID.String(), newRev, nil
+	return atURI, result, nil
 }
 
 // ListRecords returns records in a collection with pagination.
@@ -363,8 +398,10 @@ func (m *Manager) ExportRepo(ctx context.Context, pool *pgxpool.Pool, did string
 	return bs.ExportCAR(w, commitCID)
 }
 
-// openRepo loads blocks from Postgres and rebuilds the MST tree.
-func openRepo(ctx context.Context, pool *pgxpool.Pool, did string) (*MemBlockstore, mst.Tree, *repoRoot, error) {
+// openRepo loads blocks from Postgres, rebuilds the MST tree, and
+// returns a TrackingBlockstore that can distinguish new blocks from
+// preloaded ones.
+func openRepo(ctx context.Context, pool *pgxpool.Pool, did string) (*TrackingBlockstore, mst.Tree, *repoRoot, error) {
 	root, err := loadRoot(ctx, pool, did)
 	if err != nil {
 		return nil, mst.Tree{}, nil, fmt.Errorf("repo: open load root: %w", err)
@@ -391,34 +428,50 @@ func openRepo(ctx context.Context, pool *pgxpool.Pool, did string) (*MemBlocksto
 		return nil, mst.Tree{}, nil, fmt.Errorf("repo: open unmarshal commit: %w", err)
 	}
 
-	tree, err := mst.LoadTreeFromStore(ctx, bs, commit.Data)
+	tbs := NewTrackingBlockstore(bs)
+
+	tree, err := mst.LoadTreeFromStore(ctx, tbs, commit.Data)
 	if err != nil {
 		return nil, mst.Tree{}, nil, fmt.Errorf("repo: open load mst: %w", err)
 	}
 
-	return bs, *tree, root, nil
+	return tbs, *tree, root, nil
 }
 
-// commitRepo signs a new commit, writes MST blocks, and persists to Postgres.
-func commitRepo(ctx context.Context, pool *pgxpool.Pool, did string, privKey atcrypto.PrivateKey, bs *MemBlockstore, tree *mst.Tree, prevRoot *repoRoot) (commitCIDStr, rev string, err error) {
+// commitRepo signs a new commit, writes MST blocks, generates a diff
+// CAR from the TrackingBlockstore, and persists to Postgres. Returns a
+// CommitResult containing everything the firehose needs.
+func commitRepo(ctx context.Context, pool *pgxpool.Pool, did string, privKey atcrypto.PrivateKey, tbs *TrackingBlockstore, tree *mst.Tree, prevRoot *repoRoot, ops []RepoOp) (*CommitResult, error) {
 	// Write dirty MST nodes to blockstore.
-	mstRoot, err := tree.WriteDiffBlocks(ctx, bs)
+	mstRoot, err := tree.WriteDiffBlocks(ctx, tbs)
 	if err != nil {
-		return "", "", fmt.Errorf("repo: commit write mst: %w", err)
+		return nil, fmt.Errorf("repo: commit write mst: %w", err)
 	}
 
-	// Build prev CID pointer.
+	// Build prev CID pointer and capture prevData from old commit.
 	var prevCID *cid.Cid
+	var prevData *cid.Cid
+	var prevRev string
 	if prevRoot != nil {
 		c, err := cid.Decode(prevRoot.CommitCID)
 		if err != nil {
-			return "", "", fmt.Errorf("repo: commit decode prev: %w", err)
+			return nil, fmt.Errorf("repo: commit decode prev: %w", err)
 		}
 		prevCID = &c
+		prevRev = prevRoot.Rev
+
+		// Read old commit to get prevData (the MST root of previous commit).
+		oldBlk, err := tbs.Get(ctx, c)
+		if err == nil {
+			var oldCommit indigorepo.Commit
+			if err := oldCommit.UnmarshalCBOR(bytes.NewReader(oldBlk.RawData())); err == nil {
+				prevData = &oldCommit.Data
+			}
+		}
 	}
 
 	clock := syntax.NewTIDClock(0)
-	rev = clock.Next().String()
+	rev := clock.Next().String()
 
 	commit := indigorepo.Commit{
 		DID:     did,
@@ -428,23 +481,36 @@ func commitRepo(ctx context.Context, pool *pgxpool.Pool, did string, privKey atc
 		Rev:     rev,
 	}
 	if err := commit.Sign(privKey); err != nil {
-		return "", "", fmt.Errorf("repo: commit sign: %w", err)
+		return nil, fmt.Errorf("repo: commit sign: %w", err)
 	}
 
-	commitCID, err := storeCommitBlock(bs, &commit)
+	commitCID, err := storeCommitBlock(tbs.MemBlockstore, &commit)
 	if err != nil {
-		return "", "", fmt.Errorf("repo: commit store: %w", err)
+		return nil, fmt.Errorf("repo: commit store: %w", err)
+	}
+
+	// Generate diff CAR from tracking blockstore.
+	var diffBuf bytes.Buffer
+	if err := tbs.ExportDiffCAR(&diffBuf, commitCID); err != nil {
+		return nil, fmt.Errorf("repo: commit diff car: %w", err)
 	}
 
 	// Persist all blocks and update root.
-	if err := bs.PersistAll(ctx, pool, did); err != nil {
-		return "", "", fmt.Errorf("repo: commit persist: %w", err)
+	if err := tbs.MemBlockstore.PersistAll(ctx, pool, did); err != nil {
+		return nil, fmt.Errorf("repo: commit persist: %w", err)
 	}
 	if err := setRoot(ctx, pool, did, commitCID.String(), rev); err != nil {
-		return "", "", fmt.Errorf("repo: commit root: %w", err)
+		return nil, fmt.Errorf("repo: commit root: %w", err)
 	}
 
-	return commitCID.String(), rev, nil
+	return &CommitResult{
+		CommitCID: commitCID.String(),
+		Rev:       rev,
+		PrevRev:   prevRev,
+		PrevData:  prevData,
+		Ops:       ops,
+		DiffCAR:   diffBuf.Bytes(),
+	}, nil
 }
 
 // storeCommitBlock encodes a commit as CBOR and stores it in the blockstore.
