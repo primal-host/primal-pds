@@ -1,9 +1,10 @@
 // primal-pds is a multi-tenant AT Protocol Personal Data Server.
 //
 // It reads configuration from db.json in the working directory, connects
-// to PostgreSQL, bootstraps the schema, generates Traefik routing config
-// for active domains, and starts an HTTP server with both standard AT
-// Protocol endpoints and a management API.
+// to PostgreSQL, bootstraps the management schema, opens per-domain
+// tenant databases, generates Traefik routing config for active domains,
+// and starts an HTTP server with both standard AT Protocol endpoints and
+// a management API.
 //
 // Usage:
 //
@@ -49,33 +50,59 @@ func main() {
 		cancel()
 	}()
 
-	// Connect to PostgreSQL and bootstrap schema.
-	db, err := database.Open(ctx, cfg.ConnString())
+	// Open management database and bootstrap management schema.
+	mgmtDB, err := database.OpenManagement(ctx, cfg.ConnString(), cfg.ConnBase())
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to connect to management database: %v", err)
 	}
-	defer db.Close()
-	log.Println("Database connected, schema bootstrapped")
+	defer mgmtDB.Close()
+	log.Println("Management database connected, schema bootstrapped")
 
-	// Initialize stores.
-	domains := domain.NewStore(db)
-	accounts := account.NewStore(db)
-	repos := repo.NewManager(db)
+	// Initialize pool manager for tenant databases.
+	pools := database.NewPoolManager(cfg.ConnBase())
+	defer pools.Close()
 
-	// Initialize repos for any existing accounts that lack one.
-	allAccounts, err := accounts.List(ctx, 0)
+	// Initialize domain store.
+	domains := domain.NewStore(mgmtDB)
+
+	// Load existing domains and open tenant pools.
+	allDomains, err := domains.List(ctx)
 	if err != nil {
-		log.Printf("Warning: failed to list accounts for repo init: %v", err)
-	} else {
-		for _, acct := range allAccounts {
+		log.Fatalf("Failed to list domains: %v", err)
+	}
+
+	for _, d := range allDomains {
+		if err := pools.Add(ctx, d.Domain, d.DBName); err != nil {
+			log.Printf("Warning: failed to open tenant pool for %s: %v", d.Domain, err)
+			continue
+		}
+		log.Printf("Tenant pool opened: %s -> %s", d.Domain, d.DBName)
+	}
+
+	// Initialize repos for existing accounts in each tenant DB.
+	repos := repo.NewManager()
+	for _, d := range allDomains {
+		pool := pools.Get(d.Domain)
+		if pool == nil {
+			continue
+		}
+
+		tenantAccounts := account.NewStore(&database.DB{Pool: pool})
+		accts, err := tenantAccounts.List(ctx)
+		if err != nil {
+			log.Printf("Warning: failed to list accounts for %s: %v", d.Domain, err)
+			continue
+		}
+
+		for _, acct := range accts {
 			if acct.SigningKey == "" {
 				continue
 			}
-			if err := repos.InitRepo(ctx, acct.DID, acct.SigningKey); err != nil {
+			if err := repos.InitRepo(ctx, pool, acct.DID, acct.SigningKey); err != nil {
 				log.Printf("Warning: failed to init repo for %s: %v", acct.DID, err)
 			}
 		}
-		log.Printf("Repos initialized for %d accounts", len(allAccounts))
+		log.Printf("Repos initialized for %d accounts in %s", len(accts), d.Domain)
 	}
 
 	// Write Traefik config to match current database state.
@@ -86,7 +113,7 @@ func main() {
 	}
 
 	// Start the HTTP server (blocks until context is cancelled).
-	srv := server.New(cfg, domains, accounts, repos)
+	srv := server.New(cfg, mgmtDB, pools, domains, repos)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
