@@ -32,6 +32,14 @@ func (s *Server) registerRoutes() {
 	admin.GET("/xrpc/host.primal.pds.getAccount", s.handleGetAccount)
 	admin.POST("/xrpc/host.primal.pds.updateAccount", s.handleUpdateAccount)
 	admin.POST("/xrpc/host.primal.pds.deleteAccount", s.handleDeleteAccount)
+
+	// AT Protocol repo operations
+	admin.POST("/xrpc/com.atproto.repo.createRecord", s.handleCreateRecord)
+	admin.GET("/xrpc/com.atproto.repo.getRecord", s.handleGetRecord)
+	admin.POST("/xrpc/com.atproto.repo.deleteRecord", s.handleDeleteRecord)
+	admin.POST("/xrpc/com.atproto.repo.putRecord", s.handlePutRecord)
+	admin.GET("/xrpc/com.atproto.repo.listRecords", s.handleListRecords)
+	admin.GET("/xrpc/com.atproto.repo.describeRepo", s.handleDescribeRepo)
 }
 
 // =====================================================================
@@ -41,7 +49,7 @@ func (s *Server) registerRoutes() {
 // handleHealth returns basic server health information.
 func (s *Server) handleHealth(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{
-		"version": "0.2.0",
+		"version": "0.3.0",
 	})
 }
 
