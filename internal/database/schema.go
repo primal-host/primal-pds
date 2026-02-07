@@ -2,15 +2,16 @@
 // bootstraps the schema on startup.
 package database
 
-// Schema contains the SQL statements that create all tables needed by the
-// PDS. It uses CREATE TABLE IF NOT EXISTS so it is safe to run on every
-// startup — existing tables and data are preserved.
-const Schema = `
+// ManagementSchema contains the SQL statements for the management database
+// (primal_pds). It stores the domain registry and DID routing table.
+const ManagementSchema = `
 -- domains: Each row represents a domain hosted by this PDS instance.
 -- Accounts are created under a domain as <handle>.<domain>.
+-- db_name records the per-tenant database name for this domain.
 CREATE TABLE IF NOT EXISTS domains (
     id          SERIAL PRIMARY KEY,
     domain      VARCHAR(253) UNIQUE NOT NULL,
+    db_name     VARCHAR(253) NOT NULL,
     status      VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -18,6 +19,17 @@ CREATE TABLE IF NOT EXISTS domains (
 
 CREATE INDEX IF NOT EXISTS idx_domains_status ON domains(status);
 
+-- did_routing: Maps DIDs to their home domain for cross-tenant lookups.
+-- Populated on account creation, used for DID→domain resolution.
+CREATE TABLE IF NOT EXISTS did_routing (
+    did     VARCHAR(255) PRIMARY KEY,
+    domain  VARCHAR(253) NOT NULL REFERENCES domains(domain) ON DELETE CASCADE
+);
+`
+
+// TenantSchema contains the SQL statements for per-domain tenant databases.
+// Each domain gets its own database with these tables.
+const TenantSchema = `
 -- accounts: User accounts hosted under a domain.
 -- The handle is the user's AT Protocol identifier (e.g., "alice.1440.news").
 -- The domain admin account uses the bare domain as its handle (e.g., "1440.news").
@@ -39,14 +51,13 @@ CREATE TABLE IF NOT EXISTS accounts (
     handle      VARCHAR(253) UNIQUE NOT NULL,
     email       VARCHAR(255),
     password    VARCHAR(255) NOT NULL,
-    domain_id   INTEGER NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+    signing_key VARCHAR(255),
     role        VARCHAR(20) NOT NULL DEFAULT 'user',
     status      VARCHAR(20) NOT NULL DEFAULT 'active',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_accounts_domain_id ON accounts(domain_id);
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 
 -- repo_blocks: Content-addressed blocks scoped per account.
@@ -65,7 +76,4 @@ CREATE TABLE IF NOT EXISTS repo_roots (
     rev         VARCHAR(50) NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- Add signing key column to accounts.
-ALTER TABLE accounts ADD COLUMN IF NOT EXISTS signing_key VARCHAR(255);
 `
