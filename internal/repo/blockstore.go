@@ -3,10 +3,13 @@ package repo
 import (
 	"context"
 	"fmt"
+	"io"
 
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
+	car "github.com/ipld/go-car"
+	carutil "github.com/ipld/go-car/util"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -127,6 +130,104 @@ func (m *MemBlockstore) PersistAll(ctx context.Context, pool *pgxpool.Pool, did 
 			did, cidStr, blk.RawData())
 		if err != nil {
 			return fmt.Errorf("blockstore: persist block %s: %w", cidStr, err)
+		}
+	}
+	return nil
+}
+
+// ExportCAR writes ALL blocks as a CAR v1 archive. The commit block is
+// written first, followed by all other blocks in arbitrary order.
+func (m *MemBlockstore) ExportCAR(w io.Writer, commitCID cid.Cid) error {
+	h := &car.CarHeader{
+		Roots:   []cid.Cid{commitCID},
+		Version: 1,
+	}
+	if err := car.WriteHeader(h, w); err != nil {
+		return fmt.Errorf("blockstore: write car header: %w", err)
+	}
+
+	// Write commit block first.
+	commitBlk, ok := m.blocks[commitCID.KeyString()]
+	if !ok {
+		return fmt.Errorf("blockstore: commit block not found: %s", commitCID)
+	}
+	if err := carutil.LdWrite(w, commitCID.Bytes(), commitBlk.RawData()); err != nil {
+		return fmt.Errorf("blockstore: write commit block: %w", err)
+	}
+
+	// Write remaining blocks.
+	for key, blk := range m.blocks {
+		if key == commitCID.KeyString() {
+			continue
+		}
+		if err := carutil.LdWrite(w, blk.Cid().Bytes(), blk.RawData()); err != nil {
+			return fmt.Errorf("blockstore: write block %s: %w", blk.Cid(), err)
+		}
+	}
+	return nil
+}
+
+// TrackingBlockstore wraps a MemBlockstore and records which CIDs were
+// present at creation time vs. added during mutations. After a commit,
+// NewBlocks returns only the blocks that were added (the diff), which
+// is used to generate the firehose CAR payload.
+type TrackingBlockstore struct {
+	*MemBlockstore
+	preloaded map[string]bool
+}
+
+// NewTrackingBlockstore wraps an existing MemBlockstore, snapshotting
+// its current keys as "preloaded". Any blocks added after this point
+// are considered new.
+func NewTrackingBlockstore(bs *MemBlockstore) *TrackingBlockstore {
+	pre := make(map[string]bool, len(bs.blocks))
+	for k := range bs.blocks {
+		pre[k] = true
+	}
+	return &TrackingBlockstore{
+		MemBlockstore: bs,
+		preloaded:     pre,
+	}
+}
+
+// NewBlocks returns blocks that were added after the tracking snapshot.
+func (t *TrackingBlockstore) NewBlocks() []blocks.Block {
+	var out []blocks.Block
+	for k, blk := range t.MemBlockstore.blocks {
+		if !t.preloaded[k] {
+			out = append(out, blk)
+		}
+	}
+	return out
+}
+
+// ExportDiffCAR writes only the new blocks (not preloaded) as a CAR v1
+// archive. The commit block is written first.
+func (t *TrackingBlockstore) ExportDiffCAR(w io.Writer, commitCID cid.Cid) error {
+	h := &car.CarHeader{
+		Roots:   []cid.Cid{commitCID},
+		Version: 1,
+	}
+	if err := car.WriteHeader(h, w); err != nil {
+		return fmt.Errorf("blockstore: write diff car header: %w", err)
+	}
+
+	// Write commit block first.
+	commitBlk, ok := t.MemBlockstore.blocks[commitCID.KeyString()]
+	if !ok {
+		return fmt.Errorf("blockstore: commit block not found: %s", commitCID)
+	}
+	if err := carutil.LdWrite(w, commitCID.Bytes(), commitBlk.RawData()); err != nil {
+		return fmt.Errorf("blockstore: write diff commit block: %w", err)
+	}
+
+	// Write remaining new blocks.
+	for k, blk := range t.MemBlockstore.blocks {
+		if t.preloaded[k] || k == commitCID.KeyString() {
+			continue
+		}
+		if err := carutil.LdWrite(w, blk.Cid().Bytes(), blk.RawData()); err != nil {
+			return fmt.Errorf("blockstore: write diff block %s: %w", blk.Cid(), err)
 		}
 	}
 	return nil
