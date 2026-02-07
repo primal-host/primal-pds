@@ -10,23 +10,24 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	"github.com/primal-host/primal-pds/internal/account"
 	"github.com/primal-host/primal-pds/internal/config"
+	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
 	"github.com/primal-host/primal-pds/internal/repo"
 )
 
 // Server wraps the Echo instance and application dependencies.
 type Server struct {
-	echo     *echo.Echo
-	cfg      *config.Config
-	domains  *domain.Store
-	accounts *account.Store
-	repos    *repo.Manager
+	echo    *echo.Echo
+	cfg     *config.Config
+	mgmtDB  *database.ManagementDB
+	pools   *database.PoolManager
+	domains *domain.Store
+	repos   *repo.Manager
 }
 
 // New creates a configured Echo server with all routes registered.
-func New(cfg *config.Config, domains *domain.Store, accounts *account.Store, repos *repo.Manager) *Server {
+func New(cfg *config.Config, mgmtDB *database.ManagementDB, pools *database.PoolManager, domains *domain.Store, repos *repo.Manager) *Server {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true // We log the listen address ourselves.
@@ -35,11 +36,12 @@ func New(cfg *config.Config, domains *domain.Store, accounts *account.Store, rep
 	e.Use(middleware.Logger())
 
 	s := &Server{
-		echo:     e,
-		cfg:      cfg,
-		domains:  domains,
-		accounts: accounts,
-		repos:    repos,
+		echo:    e,
+		cfg:     cfg,
+		mgmtDB:  mgmtDB,
+		pools:   pools,
+		domains: domains,
+		repos:   repos,
 	}
 
 	s.registerRoutes()
