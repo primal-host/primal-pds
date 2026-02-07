@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
@@ -340,6 +341,26 @@ func (m *Manager) GetRoot(ctx context.Context, pool *pgxpool.Pool, did string) (
 		return "", "", err
 	}
 	return root.CommitCID, root.Rev, nil
+}
+
+// ExportRepo writes the full repository as a CAR v1 archive to w.
+func (m *Manager) ExportRepo(ctx context.Context, pool *pgxpool.Pool, did string, w io.Writer) error {
+	root, err := loadRoot(ctx, pool, did)
+	if err != nil {
+		return fmt.Errorf("repo: export: %w", err)
+	}
+
+	bs, err := LoadBlocks(ctx, pool, did)
+	if err != nil {
+		return fmt.Errorf("repo: export load blocks: %w", err)
+	}
+
+	commitCID, err := cid.Decode(root.CommitCID)
+	if err != nil {
+		return fmt.Errorf("repo: export decode commit cid: %w", err)
+	}
+
+	return bs.ExportCAR(w, commitCID)
 }
 
 // openRepo loads blocks from Postgres and rebuilds the MST tree.
