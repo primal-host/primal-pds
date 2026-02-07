@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,6 +21,7 @@ var ErrNotFound = errors.New("domain: not found")
 type Domain struct {
 	ID        int       `json:"id"`
 	Domain    string    `json:"domain"`
+	DBName    string    `json:"dbName"`
 	Status    string    `json:"status"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
@@ -27,24 +29,30 @@ type Domain struct {
 
 // Store provides domain CRUD operations backed by PostgreSQL.
 type Store struct {
-	db *database.DB
+	db *database.ManagementDB
 }
 
 // NewStore creates a domain Store.
-func NewStore(db *database.DB) *Store {
+func NewStore(db *database.ManagementDB) *Store {
 	return &Store{db: db}
 }
 
-// Add inserts a new domain with status "active". Returns ErrNotFound if
-// the insert fails unexpectedly, or a wrapped pgx error on constraint
-// violations (e.g., duplicate domain).
+// SanitizeDBName converts a domain name to a tenant database name.
+// Format: primal_pds_ + domain with dots replaced by underscores.
+func SanitizeDBName(domainName string) string {
+	return "primal_pds_" + strings.ReplaceAll(domainName, ".", "_")
+}
+
+// Add inserts a new domain with status "active" and a generated db_name.
 func (s *Store) Add(ctx context.Context, domainName string) (*Domain, error) {
+	dbName := SanitizeDBName(domainName)
+
 	var d Domain
 	err := s.db.Pool.QueryRow(ctx,
-		`INSERT INTO domains (domain) VALUES ($1)
-		 RETURNING id, domain, status, created_at, updated_at`,
-		domainName,
-	).Scan(&d.ID, &d.Domain, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+		`INSERT INTO domains (domain, db_name) VALUES ($1, $2)
+		 RETURNING id, domain, db_name, status, created_at, updated_at`,
+		domainName, dbName,
+	).Scan(&d.ID, &d.Domain, &d.DBName, &d.Status, &d.CreatedAt, &d.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("domain: add %q: %w", domainName, err)
 	}
@@ -54,7 +62,7 @@ func (s *Store) Add(ctx context.Context, domainName string) (*Domain, error) {
 // List returns all domains ordered by name.
 func (s *Store) List(ctx context.Context) ([]Domain, error) {
 	rows, err := s.db.Pool.Query(ctx,
-		`SELECT id, domain, status, created_at, updated_at
+		`SELECT id, domain, db_name, status, created_at, updated_at
 		 FROM domains ORDER BY domain`)
 	if err != nil {
 		return nil, fmt.Errorf("domain: list: %w", err)
@@ -64,7 +72,7 @@ func (s *Store) List(ctx context.Context) ([]Domain, error) {
 	domains := []Domain{} // empty slice, not nil (clean JSON: [] not null)
 	for rows.Next() {
 		var d Domain
-		if err := rows.Scan(&d.ID, &d.Domain, &d.Status, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Domain, &d.DBName, &d.Status, &d.CreatedAt, &d.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("domain: list scan: %w", err)
 		}
 		domains = append(domains, d)
@@ -77,10 +85,10 @@ func (s *Store) List(ctx context.Context) ([]Domain, error) {
 func (s *Store) GetByName(ctx context.Context, domainName string) (*Domain, error) {
 	var d Domain
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, domain, status, created_at, updated_at
+		`SELECT id, domain, db_name, status, created_at, updated_at
 		 FROM domains WHERE domain = $1`,
 		domainName,
-	).Scan(&d.ID, &d.Domain, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+	).Scan(&d.ID, &d.Domain, &d.DBName, &d.Status, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, domainName)
 	}
@@ -97,9 +105,9 @@ func (s *Store) Update(ctx context.Context, domainName, status string) (*Domain,
 	err := s.db.Pool.QueryRow(ctx,
 		`UPDATE domains SET status = $1, updated_at = NOW()
 		 WHERE domain = $2
-		 RETURNING id, domain, status, created_at, updated_at`,
+		 RETURNING id, domain, db_name, status, created_at, updated_at`,
 		status, domainName,
-	).Scan(&d.ID, &d.Domain, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+	).Scan(&d.ID, &d.Domain, &d.DBName, &d.Status, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, domainName)
 	}
@@ -109,24 +117,26 @@ func (s *Store) Update(ctx context.Context, domainName, status string) (*Domain,
 	return &d, nil
 }
 
-// Remove deletes a domain by name. Returns ErrNotFound if the domain
-// does not exist.
-func (s *Store) Remove(ctx context.Context, domainName string) error {
-	result, err := s.db.Pool.Exec(ctx,
-		`DELETE FROM domains WHERE domain = $1`, domainName)
+// Remove deletes a domain by name and returns its db_name so the
+// caller can drop the tenant database. Returns ErrNotFound if the
+// domain does not exist.
+func (s *Store) Remove(ctx context.Context, domainName string) (dbName string, err error) {
+	err = s.db.Pool.QueryRow(ctx,
+		`DELETE FROM domains WHERE domain = $1 RETURNING db_name`, domainName,
+	).Scan(&dbName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("%w: %s", ErrNotFound, domainName)
+	}
 	if err != nil {
-		return fmt.Errorf("domain: remove %q: %w", domainName, err)
+		return "", fmt.Errorf("domain: remove %q: %w", domainName, err)
 	}
-	if result.RowsAffected() == 0 {
-		return fmt.Errorf("%w: %s", ErrNotFound, domainName)
-	}
-	return nil
+	return dbName, nil
 }
 
 // ListActive returns only domains with status "active", ordered by name.
 func (s *Store) ListActive(ctx context.Context) ([]Domain, error) {
 	rows, err := s.db.Pool.Query(ctx,
-		`SELECT id, domain, status, created_at, updated_at
+		`SELECT id, domain, db_name, status, created_at, updated_at
 		 FROM domains WHERE status = 'active' ORDER BY domain`)
 	if err != nil {
 		return nil, fmt.Errorf("domain: list active: %w", err)
@@ -136,7 +146,7 @@ func (s *Store) ListActive(ctx context.Context) ([]Domain, error) {
 	domains := []Domain{}
 	for rows.Next() {
 		var d Domain
-		if err := rows.Scan(&d.ID, &d.Domain, &d.Status, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Domain, &d.DBName, &d.Status, &d.CreatedAt, &d.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("domain: list active scan: %w", err)
 		}
 		domains = append(domains, d)
