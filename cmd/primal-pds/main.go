@@ -22,6 +22,7 @@ import (
 	"github.com/primal-host/primal-pds/internal/config"
 	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
+	"github.com/primal-host/primal-pds/internal/repo"
 	"github.com/primal-host/primal-pds/internal/server"
 )
 
@@ -59,6 +60,23 @@ func main() {
 	// Initialize stores.
 	domains := domain.NewStore(db)
 	accounts := account.NewStore(db)
+	repos := repo.NewManager(db)
+
+	// Initialize repos for any existing accounts that lack one.
+	allAccounts, err := accounts.List(ctx, 0)
+	if err != nil {
+		log.Printf("Warning: failed to list accounts for repo init: %v", err)
+	} else {
+		for _, acct := range allAccounts {
+			if acct.SigningKey == "" {
+				continue
+			}
+			if err := repos.InitRepo(ctx, acct.DID, acct.SigningKey); err != nil {
+				log.Printf("Warning: failed to init repo for %s: %v", acct.DID, err)
+			}
+		}
+		log.Printf("Repos initialized for %d accounts", len(allAccounts))
+	}
 
 	// Write Traefik config to match current database state.
 	if err := domains.WriteTraefikConfig(ctx, cfg.TraefikConfigDir); err != nil {
@@ -68,7 +86,7 @@ func main() {
 	}
 
 	// Start the HTTP server (blocks until context is cancelled).
-	srv := server.New(cfg, domains, accounts)
+	srv := server.New(cfg, domains, accounts, repos)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
