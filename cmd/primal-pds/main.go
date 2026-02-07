@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/primal-host/primal-pds/internal/account"
 	"github.com/primal-host/primal-pds/internal/config"
 	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
@@ -55,9 +56,11 @@ func main() {
 	defer db.Close()
 	log.Println("Database connected, schema bootstrapped")
 
-	// Initialize the domain store and write Traefik config to match
-	// the current database state.
+	// Initialize stores.
 	domains := domain.NewStore(db)
+	accounts := account.NewStore(db)
+
+	// Write Traefik config to match current database state.
 	if err := domains.WriteTraefikConfig(ctx, cfg.TraefikConfigDir); err != nil {
 		log.Printf("Warning: initial Traefik config write failed: %v", err)
 	} else {
@@ -65,7 +68,7 @@ func main() {
 	}
 
 	// Start the HTTP server (blocks until context is cancelled).
-	srv := server.New(cfg, domains)
+	srv := server.New(cfg, domains, accounts)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
