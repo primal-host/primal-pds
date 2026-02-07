@@ -49,4 +49,24 @@ CREATE TABLE IF NOT EXISTS accounts (
 
 CREATE INDEX IF NOT EXISTS idx_accounts_domain_id ON accounts(domain_id);
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
+
+-- repo_blocks: Content-addressed blocks scoped per account.
+-- Stores MST nodes, record data, and commit objects as CBOR bytes.
+CREATE TABLE IF NOT EXISTS repo_blocks (
+    did   VARCHAR(255) NOT NULL,
+    cid   VARCHAR(255) NOT NULL,
+    data  BYTEA NOT NULL,
+    PRIMARY KEY (did, cid)
+);
+
+-- repo_roots: Current commit head per account repository.
+CREATE TABLE IF NOT EXISTS repo_roots (
+    did         VARCHAR(255) PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE,
+    commit_cid  VARCHAR(255) NOT NULL,
+    rev         VARCHAR(50) NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Add signing key column to accounts.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS signing_key VARCHAR(255);
 `
