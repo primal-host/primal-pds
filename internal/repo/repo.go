@@ -16,18 +16,16 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5"
-
-	"github.com/primal-host/primal-pds/internal/database"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Manager orchestrates all repository operations for the PDS.
-type Manager struct {
-	db *database.DB
-}
+// It is stateless — each method receives a tenant pool.
+type Manager struct{}
 
 // NewManager creates a repo Manager.
-func NewManager(db *database.DB) *Manager {
-	return &Manager{db: db}
+func NewManager() *Manager {
+	return &Manager{}
 }
 
 // RecordEntry represents a single record in a list response.
@@ -46,10 +44,10 @@ type repoRoot struct {
 // InitRepo creates an empty repository for a new account. It creates
 // an empty MST, signs an initial commit, and persists the blocks.
 // Safe to call multiple times — returns nil if a root already exists.
-func (m *Manager) InitRepo(ctx context.Context, did, signingKey string) error {
+func (m *Manager) InitRepo(ctx context.Context, pool *pgxpool.Pool, did, signingKey string) error {
 	// Check if repo already exists.
 	var exists bool
-	err := m.db.Pool.QueryRow(ctx,
+	err := pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM repo_roots WHERE did = $1)`, did,
 	).Scan(&exists)
 	if err != nil {
@@ -89,16 +87,16 @@ func (m *Manager) InitRepo(ctx context.Context, did, signingKey string) error {
 	}
 
 	// Encode commit to CBOR and store as a block.
-	commitCID, err := m.storeCommitBlock(ctx, bs, &commit)
+	commitCID, err := storeCommitBlock(bs, &commit)
 	if err != nil {
 		return fmt.Errorf("repo: init commit block: %w", err)
 	}
 
 	// Persist all blocks and set the root.
-	if err := bs.PersistAll(ctx, m.db.Pool, did); err != nil {
+	if err := bs.PersistAll(ctx, pool, did); err != nil {
 		return fmt.Errorf("repo: init persist: %w", err)
 	}
-	if err := m.setRoot(ctx, did, commitCID.String(), rev); err != nil {
+	if err := setRoot(ctx, pool, did, commitCID.String(), rev); err != nil {
 		return fmt.Errorf("repo: init root: %w", err)
 	}
 
@@ -107,15 +105,15 @@ func (m *Manager) InitRepo(ctx context.Context, did, signingKey string) error {
 
 // CreateRecord adds a record to an account's repository. It generates
 // a TID rkey, inserts into the MST, and creates a signed commit.
-func (m *Manager) CreateRecord(ctx context.Context, did, signingKey, collection string, record map[string]any) (uri, cidStr, rev string, err error) {
+func (m *Manager) CreateRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection string, record map[string]any) (uri, cidStr, rev string, err error) {
 	clock := syntax.NewTIDClock(0)
 	rkey := clock.Next().String()
-	return m.PutRecord(ctx, did, signingKey, collection, rkey, record)
+	return m.PutRecord(ctx, pool, did, signingKey, collection, rkey, record)
 }
 
 // GetRecord reads a record from the repo by collection + rkey.
-func (m *Manager) GetRecord(ctx context.Context, did, collection, rkey string) (cidStr string, record map[string]any, err error) {
-	bs, tree, _, err := m.openRepo(ctx, did)
+func (m *Manager) GetRecord(ctx context.Context, pool *pgxpool.Pool, did, collection, rkey string) (cidStr string, record map[string]any, err error) {
+	bs, tree, _, err := openRepo(ctx, pool, did)
 	if err != nil {
 		return "", nil, err
 	}
@@ -143,13 +141,13 @@ func (m *Manager) GetRecord(ctx context.Context, did, collection, rkey string) (
 }
 
 // DeleteRecord removes a record from the repo.
-func (m *Manager) DeleteRecord(ctx context.Context, did, signingKey, collection, rkey string) (rev string, err error) {
+func (m *Manager) DeleteRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection, rkey string) (rev string, err error) {
 	privKey, err := ParseKey(signingKey)
 	if err != nil {
 		return "", fmt.Errorf("repo: delete: %w", err)
 	}
 
-	bs, tree, root, err := m.openRepo(ctx, did)
+	bs, tree, root, err := openRepo(ctx, pool, did)
 	if err != nil {
 		return "", err
 	}
@@ -163,7 +161,7 @@ func (m *Manager) DeleteRecord(ctx context.Context, did, signingKey, collection,
 		return "", fmt.Errorf("repo: record not found: %s", path)
 	}
 
-	commitCIDStr, newRev, err := m.commitRepo(ctx, did, privKey, bs, &tree, root)
+	commitCIDStr, newRev, err := commitRepo(ctx, pool, did, privKey, bs, &tree, root)
 	if err != nil {
 		return "", err
 	}
@@ -173,7 +171,7 @@ func (m *Manager) DeleteRecord(ctx context.Context, did, signingKey, collection,
 }
 
 // PutRecord creates or updates a record at a specific rkey.
-func (m *Manager) PutRecord(ctx context.Context, did, signingKey, collection, rkey string, record map[string]any) (uri, cidStr, rev string, err error) {
+func (m *Manager) PutRecord(ctx context.Context, pool *pgxpool.Pool, did, signingKey, collection, rkey string, record map[string]any) (uri, cidStr, rev string, err error) {
 	privKey, err := ParseKey(signingKey)
 	if err != nil {
 		return "", "", "", fmt.Errorf("repo: put: %w", err)
@@ -200,7 +198,7 @@ func (m *Manager) PutRecord(ctx context.Context, did, signingKey, collection, rk
 		return "", "", "", fmt.Errorf("repo: put cid: %w", err)
 	}
 
-	bs, tree, root, err := m.openRepo(ctx, did)
+	bs, tree, root, err := openRepo(ctx, pool, did)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -220,7 +218,7 @@ func (m *Manager) PutRecord(ctx context.Context, did, signingKey, collection, rk
 		return "", "", "", fmt.Errorf("repo: put mst insert: %w", err)
 	}
 
-	commitCIDStr, newRev, err := m.commitRepo(ctx, did, privKey, bs, &tree, root)
+	commitCIDStr, newRev, err := commitRepo(ctx, pool, did, privKey, bs, &tree, root)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -231,8 +229,8 @@ func (m *Manager) PutRecord(ctx context.Context, did, signingKey, collection, rk
 }
 
 // ListRecords returns records in a collection with pagination.
-func (m *Manager) ListRecords(ctx context.Context, did, collection string, limit int, cursor string, reverse bool) ([]RecordEntry, string, error) {
-	bs, tree, _, err := m.openRepo(ctx, did)
+func (m *Manager) ListRecords(ctx context.Context, pool *pgxpool.Pool, did, collection string, limit int, cursor string, reverse bool) ([]RecordEntry, string, error) {
+	bs, tree, _, err := openRepo(ctx, pool, did)
 	if err != nil {
 		return nil, "", err
 	}
@@ -310,8 +308,8 @@ func (m *Manager) ListRecords(ctx context.Context, did, collection string, limit
 }
 
 // DescribeRepo returns the distinct collection NSIDs present in a repo.
-func (m *Manager) DescribeRepo(ctx context.Context, did string) ([]string, error) {
-	_, tree, _, err := m.openRepo(ctx, did)
+func (m *Manager) DescribeRepo(ctx context.Context, pool *pgxpool.Pool, did string) ([]string, error) {
+	_, tree, _, err := openRepo(ctx, pool, did)
 	if err != nil {
 		return nil, err
 	}
@@ -336,8 +334,8 @@ func (m *Manager) DescribeRepo(ctx context.Context, did string) ([]string, error
 }
 
 // GetRoot returns the current commit CID and rev for a DID.
-func (m *Manager) GetRoot(ctx context.Context, did string) (commitCID, rev string, err error) {
-	root, err := m.loadRoot(ctx, did)
+func (m *Manager) GetRoot(ctx context.Context, pool *pgxpool.Pool, did string) (commitCID, rev string, err error) {
+	root, err := loadRoot(ctx, pool, did)
 	if err != nil {
 		return "", "", err
 	}
@@ -345,13 +343,13 @@ func (m *Manager) GetRoot(ctx context.Context, did string) (commitCID, rev strin
 }
 
 // openRepo loads blocks from Postgres and rebuilds the MST tree.
-func (m *Manager) openRepo(ctx context.Context, did string) (*MemBlockstore, mst.Tree, *repoRoot, error) {
-	root, err := m.loadRoot(ctx, did)
+func openRepo(ctx context.Context, pool *pgxpool.Pool, did string) (*MemBlockstore, mst.Tree, *repoRoot, error) {
+	root, err := loadRoot(ctx, pool, did)
 	if err != nil {
 		return nil, mst.Tree{}, nil, fmt.Errorf("repo: open load root: %w", err)
 	}
 
-	bs, err := LoadBlocks(ctx, m.db.Pool, did)
+	bs, err := LoadBlocks(ctx, pool, did)
 	if err != nil {
 		return nil, mst.Tree{}, nil, fmt.Errorf("repo: open load blocks: %w", err)
 	}
@@ -381,7 +379,7 @@ func (m *Manager) openRepo(ctx context.Context, did string) (*MemBlockstore, mst
 }
 
 // commitRepo signs a new commit, writes MST blocks, and persists to Postgres.
-func (m *Manager) commitRepo(ctx context.Context, did string, privKey atcrypto.PrivateKey, bs *MemBlockstore, tree *mst.Tree, prevRoot *repoRoot) (commitCIDStr, rev string, err error) {
+func commitRepo(ctx context.Context, pool *pgxpool.Pool, did string, privKey atcrypto.PrivateKey, bs *MemBlockstore, tree *mst.Tree, prevRoot *repoRoot) (commitCIDStr, rev string, err error) {
 	// Write dirty MST nodes to blockstore.
 	mstRoot, err := tree.WriteDiffBlocks(ctx, bs)
 	if err != nil {
@@ -412,16 +410,16 @@ func (m *Manager) commitRepo(ctx context.Context, did string, privKey atcrypto.P
 		return "", "", fmt.Errorf("repo: commit sign: %w", err)
 	}
 
-	commitCID, err := m.storeCommitBlock(ctx, bs, &commit)
+	commitCID, err := storeCommitBlock(bs, &commit)
 	if err != nil {
 		return "", "", fmt.Errorf("repo: commit store: %w", err)
 	}
 
 	// Persist all blocks and update root.
-	if err := bs.PersistAll(ctx, m.db.Pool, did); err != nil {
+	if err := bs.PersistAll(ctx, pool, did); err != nil {
 		return "", "", fmt.Errorf("repo: commit persist: %w", err)
 	}
-	if err := m.setRoot(ctx, did, commitCID.String(), rev); err != nil {
+	if err := setRoot(ctx, pool, did, commitCID.String(), rev); err != nil {
 		return "", "", fmt.Errorf("repo: commit root: %w", err)
 	}
 
@@ -429,7 +427,7 @@ func (m *Manager) commitRepo(ctx context.Context, did string, privKey atcrypto.P
 }
 
 // storeCommitBlock encodes a commit as CBOR and stores it in the blockstore.
-func (m *Manager) storeCommitBlock(_ context.Context, bs *MemBlockstore, commit *indigorepo.Commit) (cid.Cid, error) {
+func storeCommitBlock(bs *MemBlockstore, commit *indigorepo.Commit) (cid.Cid, error) {
 	var buf bytes.Buffer
 	if err := commit.MarshalCBOR(&buf); err != nil {
 		return cid.Undef, fmt.Errorf("marshal commit cbor: %w", err)
@@ -451,9 +449,9 @@ func (m *Manager) storeCommitBlock(_ context.Context, bs *MemBlockstore, commit 
 }
 
 // loadRoot loads the repo root from Postgres.
-func (m *Manager) loadRoot(ctx context.Context, did string) (*repoRoot, error) {
+func loadRoot(ctx context.Context, pool *pgxpool.Pool, did string) (*repoRoot, error) {
 	var root repoRoot
-	err := m.db.Pool.QueryRow(ctx,
+	err := pool.QueryRow(ctx,
 		`SELECT commit_cid, rev FROM repo_roots WHERE did = $1`, did,
 	).Scan(&root.CommitCID, &root.Rev)
 	if err == pgx.ErrNoRows {
@@ -466,8 +464,8 @@ func (m *Manager) loadRoot(ctx context.Context, did string) (*repoRoot, error) {
 }
 
 // setRoot inserts or updates the repo root in Postgres.
-func (m *Manager) setRoot(ctx context.Context, did, commitCID, rev string) error {
-	_, err := m.db.Pool.Exec(ctx,
+func setRoot(ctx context.Context, pool *pgxpool.Pool, did, commitCID, rev string) error {
+	_, err := pool.Exec(ctx,
 		`INSERT INTO repo_roots (did, commit_cid, rev)
 		 VALUES ($1, $2, $3)
 		 ON CONFLICT (did) DO UPDATE SET commit_cid = $2, rev = $3, updated_at = NOW()`,
