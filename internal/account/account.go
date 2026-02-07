@@ -1,6 +1,6 @@
 // Package account provides the data model and operations for AT Protocol
-// user accounts. Accounts belong to a domain and are identified by a
-// DID (decentralized identifier) and a handle (DNS-based username).
+// user accounts. In the multi-tenant architecture, each domain has its
+// own database — all accounts in a tenant DB belong to the same domain.
 //
 // Roles control what an account can do within its domain:
 //   - owner: the domain admin account, auto-created with the domain
@@ -55,7 +55,6 @@ type Account struct {
 	Handle     string    `json:"handle"`
 	Email      string    `json:"email,omitempty"`
 	SigningKey string    `json:"signingKey,omitempty"`
-	DomainID   int       `json:"domainId"`
 	Role       string    `json:"role"`
 	Status     string    `json:"status"`
 	CreatedAt  time.Time `json:"createdAt"`
@@ -67,7 +66,6 @@ type CreateParams struct {
 	Handle   string
 	Email    string
 	Password string // plaintext, will be hashed
-	DomainID int
 	Role     string // defaults to "user" if empty
 }
 
@@ -107,11 +105,11 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Account, error) {
 
 	var a Account
 	err = s.db.Pool.QueryRow(ctx,
-		`INSERT INTO accounts (did, handle, email, password, signing_key, domain_id, role)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at`,
-		did, p.Handle, p.Email, hash, signingKey, p.DomainID, role,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+		`INSERT INTO accounts (did, handle, email, password, signing_key, role)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), role, status, created_at, updated_at`,
+		did, p.Handle, p.Email, hash, signingKey, role,
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("account: create %q: %w", p.Handle, err)
 	}
@@ -123,10 +121,10 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Account, error) {
 func (s *Store) GetByHandle(ctx context.Context, handle string) (*Account, error) {
 	var a Account
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
+		`SELECT id, did, handle, email, COALESCE(signing_key, ''), role, status, created_at, updated_at
 		 FROM accounts WHERE handle = $1`,
 		handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
@@ -141,10 +139,10 @@ func (s *Store) GetByHandle(ctx context.Context, handle string) (*Account, error
 func (s *Store) GetByDID(ctx context.Context, did string) (*Account, error) {
 	var a Account
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
+		`SELECT id, did, handle, email, COALESCE(signing_key, ''), role, status, created_at, updated_at
 		 FROM accounts WHERE did = $1`,
 		did,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, did)
 	}
@@ -154,22 +152,11 @@ func (s *Store) GetByDID(ctx context.Context, did string) (*Account, error) {
 	return &a, nil
 }
 
-// List returns all accounts, optionally filtered by domain ID.
-// Pass domainID <= 0 to list all accounts across all domains.
-func (s *Store) List(ctx context.Context, domainID int) ([]Account, error) {
-	var query string
-	var args []any
-
-	if domainID > 0 {
-		query = `SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
-				 FROM accounts WHERE domain_id = $1 ORDER BY handle`
-		args = []any{domainID}
-	} else {
-		query = `SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
-				 FROM accounts ORDER BY handle`
-	}
-
-	rows, err := s.db.Pool.Query(ctx, query, args...)
+// List returns all accounts in the tenant database ordered by handle.
+func (s *Store) List(ctx context.Context) ([]Account, error) {
+	rows, err := s.db.Pool.Query(ctx,
+		`SELECT id, did, handle, email, COALESCE(signing_key, ''), role, status, created_at, updated_at
+		 FROM accounts ORDER BY handle`)
 	if err != nil {
 		return nil, fmt.Errorf("account: list: %w", err)
 	}
@@ -178,7 +165,7 @@ func (s *Store) List(ctx context.Context, domainID int) ([]Account, error) {
 	accounts := []Account{}
 	for rows.Next() {
 		var a Account
-		if err := rows.Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("account: list scan: %w", err)
 		}
 		accounts = append(accounts, a)
@@ -204,9 +191,9 @@ func (s *Store) UpdateStatus(ctx context.Context, handle, status string) (*Accou
 	err := s.db.Pool.QueryRow(ctx,
 		`UPDATE accounts SET status = $1, updated_at = NOW()
 		 WHERE handle = $2
-		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at`,
+		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), role, status, created_at, updated_at`,
 		status, handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
@@ -237,9 +224,9 @@ func (s *Store) UpdateRole(ctx context.Context, handle, role string) (*Account, 
 	err = s.db.Pool.QueryRow(ctx,
 		`UPDATE accounts SET role = $1, updated_at = NOW()
 		 WHERE handle = $2
-		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at`,
+		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), role, status, created_at, updated_at`,
 		role, handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
@@ -250,7 +237,7 @@ func (s *Store) UpdateRole(ctx context.Context, handle, role string) (*Account, 
 }
 
 // Delete permanently removes an account. Owner accounts cannot be
-// deleted directly — remove the domain instead (CASCADE will handle it).
+// deleted directly — remove the domain instead.
 func (s *Store) Delete(ctx context.Context, handle string) error {
 	existing, err := s.GetByHandle(ctx, handle)
 	if err != nil {
@@ -296,10 +283,10 @@ func (s *Store) VerifyPassword(ctx context.Context, handle, password string) (*A
 	var a Account
 	var hash string
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, did, handle, email, password, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
+		`SELECT id, did, handle, email, password, COALESCE(signing_key, ''), role, status, created_at, updated_at
 		 FROM accounts WHERE handle = $1`,
 		handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &hash, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &hash, &a.SigningKey, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
