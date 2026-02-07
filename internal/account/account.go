@@ -22,6 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/primal-host/primal-pds/internal/database"
+	"github.com/primal-host/primal-pds/internal/repo"
 )
 
 // Sentinel errors for account operations.
@@ -49,15 +50,16 @@ const (
 
 // Account represents a user account hosted under a domain.
 type Account struct {
-	ID        int       `json:"id"`
-	DID       string    `json:"did"`
-	Handle    string    `json:"handle"`
-	Email     string    `json:"email,omitempty"`
-	DomainID  int       `json:"domainId"`
-	Role      string    `json:"role"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID         int       `json:"id"`
+	DID        string    `json:"did"`
+	Handle     string    `json:"handle"`
+	Email      string    `json:"email,omitempty"`
+	SigningKey string    `json:"signingKey,omitempty"`
+	DomainID   int       `json:"domainId"`
+	Role       string    `json:"role"`
+	Status     string    `json:"status"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 // CreateParams holds the parameters for creating a new account.
@@ -93,6 +95,11 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Account, error) {
 		return nil, fmt.Errorf("account: create: %w", err)
 	}
 
+	signingKey, err := repo.GenerateKey()
+	if err != nil {
+		return nil, fmt.Errorf("account: create signing key: %w", err)
+	}
+
 	role := p.Role
 	if role == "" {
 		role = RoleUser
@@ -100,11 +107,11 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Account, error) {
 
 	var a Account
 	err = s.db.Pool.QueryRow(ctx,
-		`INSERT INTO accounts (did, handle, email, password, domain_id, role)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 RETURNING id, did, handle, email, domain_id, role, status, created_at, updated_at`,
-		did, p.Handle, p.Email, hash, p.DomainID, role,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+		`INSERT INTO accounts (did, handle, email, password, signing_key, domain_id, role)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at`,
+		did, p.Handle, p.Email, hash, signingKey, p.DomainID, role,
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("account: create %q: %w", p.Handle, err)
 	}
@@ -116,10 +123,10 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (*Account, error) {
 func (s *Store) GetByHandle(ctx context.Context, handle string) (*Account, error) {
 	var a Account
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, did, handle, email, domain_id, role, status, created_at, updated_at
+		`SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
 		 FROM accounts WHERE handle = $1`,
 		handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
@@ -134,10 +141,10 @@ func (s *Store) GetByHandle(ctx context.Context, handle string) (*Account, error
 func (s *Store) GetByDID(ctx context.Context, did string) (*Account, error) {
 	var a Account
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, did, handle, email, domain_id, role, status, created_at, updated_at
+		`SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
 		 FROM accounts WHERE did = $1`,
 		did,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, did)
 	}
@@ -154,11 +161,11 @@ func (s *Store) List(ctx context.Context, domainID int) ([]Account, error) {
 	var args []any
 
 	if domainID > 0 {
-		query = `SELECT id, did, handle, email, domain_id, role, status, created_at, updated_at
+		query = `SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
 				 FROM accounts WHERE domain_id = $1 ORDER BY handle`
 		args = []any{domainID}
 	} else {
-		query = `SELECT id, did, handle, email, domain_id, role, status, created_at, updated_at
+		query = `SELECT id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
 				 FROM accounts ORDER BY handle`
 	}
 
@@ -171,7 +178,7 @@ func (s *Store) List(ctx context.Context, domainID int) ([]Account, error) {
 	accounts := []Account{}
 	for rows.Next() {
 		var a Account
-		if err := rows.Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("account: list scan: %w", err)
 		}
 		accounts = append(accounts, a)
@@ -197,9 +204,9 @@ func (s *Store) UpdateStatus(ctx context.Context, handle, status string) (*Accou
 	err := s.db.Pool.QueryRow(ctx,
 		`UPDATE accounts SET status = $1, updated_at = NOW()
 		 WHERE handle = $2
-		 RETURNING id, did, handle, email, domain_id, role, status, created_at, updated_at`,
+		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at`,
 		status, handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
@@ -230,9 +237,9 @@ func (s *Store) UpdateRole(ctx context.Context, handle, role string) (*Account, 
 	err = s.db.Pool.QueryRow(ctx,
 		`UPDATE accounts SET role = $1, updated_at = NOW()
 		 WHERE handle = $2
-		 RETURNING id, did, handle, email, domain_id, role, status, created_at, updated_at`,
+		 RETURNING id, did, handle, email, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at`,
 		role, handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
@@ -289,10 +296,10 @@ func (s *Store) VerifyPassword(ctx context.Context, handle, password string) (*A
 	var a Account
 	var hash string
 	err := s.db.Pool.QueryRow(ctx,
-		`SELECT id, did, handle, email, password, domain_id, role, status, created_at, updated_at
+		`SELECT id, did, handle, email, password, COALESCE(signing_key, ''), domain_id, role, status, created_at, updated_at
 		 FROM accounts WHERE handle = $1`,
 		handle,
-	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &hash, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.DID, &a.Handle, &a.Email, &hash, &a.SigningKey, &a.DomainID, &a.Role, &a.Status, &a.CreatedAt, &a.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, handle)
 	}
