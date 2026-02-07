@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	"github.com/primal-host/primal-pds/internal/account"
+	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
 )
 
@@ -42,6 +44,20 @@ func (s *Server) registerRoutes() {
 	admin.GET("/xrpc/com.atproto.repo.describeRepo", s.handleDescribeRepo)
 }
 
+// tenantStore creates an ephemeral account.Store backed by a tenant pool.
+func (s *Server) tenantStore(pool *pgxpool.Pool) *account.Store {
+	return account.NewStore(&database.DB{Pool: pool})
+}
+
+// resolveDomainPool looks up a domain by name and returns its tenant pool.
+func (s *Server) resolveDomainPool(c echo.Context, domainName string) (*pgxpool.Pool, error) {
+	pool := s.pools.Get(domainName)
+	if pool == nil {
+		return nil, domain.ErrNotFound
+	}
+	return pool, nil
+}
+
 // =====================================================================
 // Public endpoints
 // =====================================================================
@@ -49,17 +65,49 @@ func (s *Server) registerRoutes() {
 // handleHealth returns basic server health information.
 func (s *Server) handleHealth(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{
-		"version": "0.3.0",
+		"version": "0.4.0",
 	})
 }
 
 // handleAtprotoDID resolves a DID for the handle implied by the Host
 // header. The Host header (e.g., "alice.1440.news") is looked up in the
-// accounts table to find the corresponding DID.
+// tenant database to find the corresponding DID.
 func (s *Server) handleAtprotoDID(c echo.Context) error {
 	handle := stripPort(c.Request().Host)
+	ctx := c.Request().Context()
 
-	did, err := s.accounts.ResolveHandle(c.Request().Context(), handle)
+	// Extract domain from handle by trying progressively shorter suffixes.
+	// e.g., "alice.1440.news" → try "1440.news", then "news"
+	domainName := ""
+	parts := strings.Split(handle, ".")
+	for i := 1; i < len(parts); i++ {
+		candidate := strings.Join(parts[i:], ".")
+		pool := s.pools.Get(candidate)
+		if pool != nil {
+			domainName = candidate
+			break
+		}
+	}
+
+	if domainName == "" {
+		// Maybe the handle IS the domain (bare domain handle like "1440.news").
+		pool := s.pools.Get(handle)
+		if pool != nil {
+			domainName = handle
+		}
+	}
+
+	if domainName == "" {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error":   "AccountNotFound",
+			"message": "No account found for handle: " + handle,
+		})
+	}
+
+	pool := s.pools.Get(domainName)
+	accounts := s.tenantStore(pool)
+
+	did, err := accounts.ResolveHandle(ctx, handle)
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{
@@ -92,10 +140,9 @@ type addDomainResponse struct {
 	AdminPassword string           `json:"adminPassword"`
 }
 
-// handleAddDomain creates a new hosted domain, auto-creates the domain
-// admin (owner) account, and regenerates the Traefik routing config.
-// The response includes the auto-generated admin password — this is the
-// only time it's returned in plaintext.
+// handleAddDomain creates a new hosted domain, provisions a tenant
+// database, auto-creates the domain admin (owner) account, and
+// regenerates the Traefik routing config.
 func (s *Server) handleAddDomain(c echo.Context) error {
 	var req addDomainRequest
 	if err := c.Bind(&req); err != nil {
@@ -115,7 +162,7 @@ func (s *Server) handleAddDomain(c echo.Context) error {
 
 	ctx := c.Request().Context()
 
-	// Create the domain.
+	// Create the domain row in management DB.
 	d, err := s.domains.Add(ctx, req.Domain)
 	if err != nil {
 		if isDuplicateKey(err) {
@@ -131,8 +178,28 @@ func (s *Server) handleAddDomain(c echo.Context) error {
 		})
 	}
 
+	// Create the tenant database.
+	if err := s.mgmtDB.CreateTenantDB(ctx, d.DBName); err != nil {
+		log.Printf("Error creating tenant DB for %q: %v", req.Domain, err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error":   "InternalError",
+			"message": "Failed to create tenant database",
+		})
+	}
+
+	// Open the tenant pool and bootstrap schema.
+	if err := s.pools.Add(ctx, req.Domain, d.DBName); err != nil {
+		log.Printf("Error opening tenant pool for %q: %v", req.Domain, err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error":   "InternalError",
+			"message": "Failed to open tenant database",
+		})
+	}
+
+	pool := s.pools.Get(req.Domain)
+	accounts := s.tenantStore(pool)
+
 	// Auto-create the domain admin (owner) account.
-	// The handle is the bare domain name (e.g., "1440.news").
 	adminPass, err := account.GeneratePassword()
 	if err != nil {
 		log.Printf("Error generating admin password for %q: %v", req.Domain, err)
@@ -142,15 +209,12 @@ func (s *Server) handleAddDomain(c echo.Context) error {
 		})
 	}
 
-	adminAcct, err := s.accounts.Create(ctx, account.CreateParams{
+	adminAcct, err := accounts.Create(ctx, account.CreateParams{
 		Handle:   req.Domain,
 		Password: adminPass,
-		DomainID: d.ID,
 		Role:     account.RoleOwner,
 	})
 	if err != nil {
-		// Domain was created but admin account failed. Log but don't
-		// roll back the domain — it can be retried.
 		log.Printf("Error creating admin account for domain %q: %v", req.Domain, err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{
 			"error":   "InternalError",
@@ -158,8 +222,18 @@ func (s *Server) handleAddDomain(c echo.Context) error {
 		})
 	}
 
+	// Insert DID routing.
+	if err := s.mgmtDB.InsertDIDRouting(ctx, adminAcct.DID, req.Domain); err != nil {
+		log.Printf("Error inserting DID routing for %q: %v", adminAcct.DID, err)
+	}
+
+	// Init repo for the admin account.
+	if err := s.repos.InitRepo(ctx, pool, adminAcct.DID, adminAcct.SigningKey); err != nil {
+		log.Printf("Warning: failed to init repo for admin %s: %v", adminAcct.DID, err)
+	}
+
 	s.refreshTraefik(c)
-	log.Printf("Domain added: %s (admin: %s, did: %s)", req.Domain, adminAcct.Handle, adminAcct.DID)
+	log.Printf("Domain added: %s (admin: %s, did: %s, db: %s)", req.Domain, adminAcct.Handle, adminAcct.DID, d.DBName)
 
 	return c.JSON(http.StatusOK, addDomainResponse{
 		Domain:        d,
@@ -239,8 +313,8 @@ type removeDomainRequest struct {
 	Domain string `json:"domain"`
 }
 
-// handleRemoveDomain deletes a domain (and all its accounts via CASCADE)
-// and regenerates the Traefik routing configuration.
+// handleRemoveDomain deletes a domain, drops its tenant database, and
+// regenerates the Traefik routing configuration.
 func (s *Server) handleRemoveDomain(c echo.Context) error {
 	var req removeDomainRequest
 	if err := c.Bind(&req); err != nil {
@@ -258,7 +332,11 @@ func (s *Server) handleRemoveDomain(c echo.Context) error {
 		})
 	}
 
-	if err := s.domains.Remove(c.Request().Context(), req.Domain); err != nil {
+	ctx := c.Request().Context()
+
+	// Remove domain from management DB (returns db_name, CASCADE deletes did_routing rows).
+	dbName, err := s.domains.Remove(ctx, req.Domain)
+	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{
 				"error":   "DomainNotFound",
@@ -272,8 +350,14 @@ func (s *Server) handleRemoveDomain(c echo.Context) error {
 		})
 	}
 
+	// Close tenant pool, then drop tenant database.
+	s.pools.Remove(req.Domain)
+	if err := s.mgmtDB.DropTenantDB(ctx, dbName); err != nil {
+		log.Printf("Warning: failed to drop tenant DB %q: %v", dbName, err)
+	}
+
 	s.refreshTraefik(c)
-	log.Printf("Domain removed: %s (all accounts cascade-deleted)", req.Domain)
+	log.Printf("Domain removed: %s (tenant db: %s dropped)", req.Domain, dbName)
 	return c.JSON(http.StatusOK, map[string]string{
 		"message": "Domain removed: " + req.Domain,
 	})
@@ -338,8 +422,8 @@ func (s *Server) handleCreateAccount(c echo.Context) error {
 
 	ctx := c.Request().Context()
 
-	// Look up the domain.
-	d, err := s.domains.GetByName(ctx, req.Domain)
+	// Look up the domain and get tenant pool.
+	_, err := s.domains.GetByName(ctx, req.Domain)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{
@@ -353,6 +437,17 @@ func (s *Server) handleCreateAccount(c echo.Context) error {
 			"message": "Failed to look up domain",
 		})
 	}
+
+	pool, err := s.resolveDomainPool(c, req.Domain)
+	if err != nil {
+		log.Printf("Error resolving tenant pool for %q: %v", req.Domain, err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error":   "InternalError",
+			"message": "Tenant database not available for domain",
+		})
+	}
+
+	accounts := s.tenantStore(pool)
 
 	// Build the full handle: "alice" + "1440.news" → "alice.1440.news".
 	// If the handle already ends with the domain, use it as-is.
@@ -375,11 +470,10 @@ func (s *Server) handleCreateAccount(c echo.Context) error {
 		autoGenerated = true
 	}
 
-	acct, err := s.accounts.Create(ctx, account.CreateParams{
+	acct, err := accounts.Create(ctx, account.CreateParams{
 		Handle:   fullHandle,
 		Email:    req.Email,
 		Password: password,
-		DomainID: d.ID,
 		Role:     req.Role,
 	})
 	if err != nil {
@@ -396,6 +490,16 @@ func (s *Server) handleCreateAccount(c echo.Context) error {
 		})
 	}
 
+	// Insert DID routing in management DB.
+	if err := s.mgmtDB.InsertDIDRouting(ctx, acct.DID, req.Domain); err != nil {
+		log.Printf("Error inserting DID routing for %q: %v", acct.DID, err)
+	}
+
+	// Init repo for the new account.
+	if err := s.repos.InitRepo(ctx, pool, acct.DID, acct.SigningKey); err != nil {
+		log.Printf("Warning: failed to init repo for %s: %v", acct.DID, err)
+	}
+
 	log.Printf("Account created: %s (did: %s, role: %s, domain: %s)", acct.Handle, acct.DID, acct.Role, req.Domain)
 
 	resp := map[string]any{"account": acct}
@@ -405,31 +509,45 @@ func (s *Server) handleCreateAccount(c echo.Context) error {
 	return c.JSON(http.StatusOK, resp)
 }
 
-// handleListAccounts returns accounts, optionally filtered by domain.
-// Query parameter: ?domain=1440.news
+// handleListAccounts returns accounts for a domain.
+// Query parameter: ?domain=1440.news (required)
 func (s *Server) handleListAccounts(c echo.Context) error {
 	ctx := c.Request().Context()
-	domainID := 0
+	domainName := c.QueryParam("domain")
 
-	if domainName := c.QueryParam("domain"); domainName != "" {
-		d, err := s.domains.GetByName(ctx, domainName)
-		if err != nil {
-			if errors.Is(err, domain.ErrNotFound) {
-				return c.JSON(http.StatusNotFound, map[string]string{
-					"error":   "DomainNotFound",
-					"message": "Domain not found: " + domainName,
-				})
-			}
-			log.Printf("Error looking up domain %q: %v", domainName, err)
-			return c.JSON(http.StatusInternalServerError, map[string]string{
-				"error":   "InternalError",
-				"message": "Failed to look up domain",
-			})
-		}
-		domainID = d.ID
+	if domainName == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error":   "InvalidRequest",
+			"message": "domain query parameter is required",
+		})
 	}
 
-	accounts, err := s.accounts.List(ctx, domainID)
+	_, err := s.domains.GetByName(ctx, domainName)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{
+				"error":   "DomainNotFound",
+				"message": "Domain not found: " + domainName,
+			})
+		}
+		log.Printf("Error looking up domain %q: %v", domainName, err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error":   "InternalError",
+			"message": "Failed to look up domain",
+		})
+	}
+
+	pool, err := s.resolveDomainPool(c, domainName)
+	if err != nil {
+		log.Printf("Error resolving tenant pool for %q: %v", domainName, err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{
+			"error":   "InternalError",
+			"message": "Tenant database not available for domain",
+		})
+	}
+
+	accounts := s.tenantStore(pool)
+	list, err := accounts.List(ctx)
 	if err != nil {
 		log.Printf("Error listing accounts: %v", err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{
@@ -438,7 +556,7 @@ func (s *Server) handleListAccounts(c echo.Context) error {
 		})
 	}
 	return c.JSON(http.StatusOK, map[string]any{
-		"accounts": accounts,
+		"accounts": list,
 	})
 }
 
@@ -456,12 +574,44 @@ func (s *Server) handleGetAccount(c echo.Context) error {
 		})
 	}
 
-	var acct *account.Account
+	// Resolve the domain to get the right tenant pool.
+	var domainName string
 	var err error
-	if handle != "" {
-		acct, err = s.accounts.GetByHandle(ctx, handle)
+
+	if did != "" {
+		// Look up domain from DID routing table.
+		domainName, err = s.mgmtDB.LookupDIDDomain(ctx, did)
+		if err != nil {
+			return c.JSON(http.StatusNotFound, map[string]string{
+				"error":   "AccountNotFound",
+				"message": "Account not found",
+			})
+		}
 	} else {
-		acct, err = s.accounts.GetByDID(ctx, did)
+		// Extract domain from handle suffix.
+		domainName = extractDomainFromHandle(handle, s.pools)
+		if domainName == "" {
+			return c.JSON(http.StatusNotFound, map[string]string{
+				"error":   "AccountNotFound",
+				"message": "Account not found",
+			})
+		}
+	}
+
+	pool, err := s.resolveDomainPool(c, domainName)
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error":   "AccountNotFound",
+			"message": "Account not found",
+		})
+	}
+
+	accounts := s.tenantStore(pool)
+	var acct *account.Account
+	if handle != "" {
+		acct, err = accounts.GetByHandle(ctx, handle)
+	} else {
+		acct, err = accounts.GetByDID(ctx, did)
 	}
 
 	if err != nil {
@@ -513,8 +663,26 @@ func (s *Server) handleUpdateAccount(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
+
+	// Resolve domain from handle.
+	domainName := extractDomainFromHandle(req.Handle, s.pools)
+	if domainName == "" {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error":   "AccountNotFound",
+			"message": "Account not found: " + req.Handle,
+		})
+	}
+
+	pool, err := s.resolveDomainPool(c, domainName)
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error":   "AccountNotFound",
+			"message": "Account not found: " + req.Handle,
+		})
+	}
+
+	accounts := s.tenantStore(pool)
 	var result *account.Account
-	var err error
 
 	// Update status if provided.
 	if req.Status != "" {
@@ -527,7 +695,7 @@ func (s *Server) handleUpdateAccount(c echo.Context) error {
 			})
 		}
 
-		result, err = s.accounts.UpdateStatus(ctx, req.Handle, req.Status)
+		result, err = accounts.UpdateStatus(ctx, req.Handle, req.Status)
 		if err != nil {
 			return accountError(c, err, req.Handle)
 		}
@@ -544,7 +712,7 @@ func (s *Server) handleUpdateAccount(c echo.Context) error {
 			})
 		}
 
-		result, err = s.accounts.UpdateRole(ctx, req.Handle, req.Role)
+		result, err = accounts.UpdateRole(ctx, req.Handle, req.Role)
 		if err != nil {
 			return accountError(c, err, req.Handle)
 		}
@@ -577,8 +745,40 @@ func (s *Server) handleDeleteAccount(c echo.Context) error {
 		})
 	}
 
-	if err := s.accounts.Delete(c.Request().Context(), req.Handle); err != nil {
+	ctx := c.Request().Context()
+
+	// Resolve domain from handle.
+	domainName := extractDomainFromHandle(req.Handle, s.pools)
+	if domainName == "" {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error":   "AccountNotFound",
+			"message": "Account not found: " + req.Handle,
+		})
+	}
+
+	pool, err := s.resolveDomainPool(c, domainName)
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{
+			"error":   "AccountNotFound",
+			"message": "Account not found: " + req.Handle,
+		})
+	}
+
+	accounts := s.tenantStore(pool)
+
+	// Get the account first to find the DID for routing cleanup.
+	acct, err := accounts.GetByHandle(ctx, req.Handle)
+	if err != nil {
 		return accountError(c, err, req.Handle)
+	}
+
+	if err := accounts.Delete(ctx, req.Handle); err != nil {
+		return accountError(c, err, req.Handle)
+	}
+
+	// Remove DID routing.
+	if err := s.mgmtDB.DeleteDIDRouting(ctx, acct.DID); err != nil {
+		log.Printf("Warning: failed to delete DID routing for %s: %v", acct.DID, err)
 	}
 
 	log.Printf("Account deleted: %s", req.Handle)
@@ -618,6 +818,27 @@ func accountError(c echo.Context, err error, handle string) error {
 			"message": "Failed to update account",
 		})
 	}
+}
+
+// extractDomainFromHandle extracts the domain name from a handle by
+// trying progressively shorter suffixes against the pool manager.
+// e.g., "alice.1440.news" → "1440.news" if that pool exists.
+// Also handles bare domain handles like "1440.news".
+func extractDomainFromHandle(handle string, pools *database.PoolManager) string {
+	// First check if the handle itself is a domain (bare domain handle).
+	if pools.Get(handle) != nil {
+		return handle
+	}
+
+	// Try progressively shorter suffixes.
+	parts := strings.Split(handle, ".")
+	for i := 1; i < len(parts); i++ {
+		candidate := strings.Join(parts[i:], ".")
+		if pools.Get(candidate) != nil {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // stripPort removes the port suffix from a host string.
