@@ -13,6 +13,7 @@ import (
 	"github.com/primal-host/primal-pds/internal/account"
 	"github.com/primal-host/primal-pds/internal/config"
 	"github.com/primal-host/primal-pds/internal/domain"
+	"github.com/primal-host/primal-pds/internal/repo"
 )
 
 // Server wraps the Echo instance and application dependencies.
@@ -21,10 +22,11 @@ type Server struct {
 	cfg      *config.Config
 	domains  *domain.Store
 	accounts *account.Store
+	repos    *repo.Manager
 }
 
 // New creates a configured Echo server with all routes registered.
-func New(cfg *config.Config, domains *domain.Store, accounts *account.Store) *Server {
+func New(cfg *config.Config, domains *domain.Store, accounts *account.Store, repos *repo.Manager) *Server {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true // We log the listen address ourselves.
@@ -37,6 +39,7 @@ func New(cfg *config.Config, domains *domain.Store, accounts *account.Store) *Se
 		cfg:      cfg,
 		domains:  domains,
 		accounts: accounts,
+		repos:    repos,
 	}
 
 	s.registerRoutes()
