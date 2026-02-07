@@ -24,7 +24,7 @@ go vet ./...
 
 - `cmd/primal-pds/main.go` — Entry point, wires config + db + server
 - `internal/config/` — db.json config loading and validation
-- `internal/database/` — PostgreSQL connection pool and schema bootstrap
+- `internal/database/` — Management DB, tenant pool manager, schema bootstrap
 - `internal/domain/` — Domain model, CRUD, and Traefik config generation
 - `internal/account/` — Account model, CRUD, DID generation, password hashing
 - `internal/repo/` — AT Protocol repository: MST, blockstore, CBOR, signing
@@ -34,16 +34,26 @@ go vet ./...
 
 Loaded from `db.json` in the working directory. See `db.json.example`.
 
-## Database
+## Database Architecture
 
-PostgreSQL with pgx connection pool. Schema auto-created on startup
-using `CREATE TABLE IF NOT EXISTS`.
+Per-domain database isolation for multi-tenant PDS-as-a-service.
 
-Tables:
-- `domains` — hosted domain configurations
-- `accounts` — user accounts with signing keys
-- `repo_blocks` — content-addressed CBOR blocks per account (MST nodes, records, commits)
+**Management database** (`primal_pds`):
+- `domains` — domain registry with `db_name` for each tenant database
+- `did_routing` — maps DIDs to their home domain for cross-tenant lookups
+
+**Tenant databases** (`primal_pds_<sanitized_domain>`):
+- `accounts` — user accounts with signing keys (no domain_id FK)
+- `repo_blocks` — content-addressed CBOR blocks per account
 - `repo_roots` — current commit head per account repository
+
+Domain name → database name: `primal_pds_` + domain with dots→underscores.
+Example: `1440.news` → `primal_pds_1440_news`
+
+The `dba_primal_pds` Postgres role needs `CREATEDB` privilege:
+```sql
+ALTER ROLE dba_primal_pds CREATEDB;
+```
 
 ## Account Model
 
@@ -63,17 +73,26 @@ of records with signed commits (version 3).
 - Mutations create new signed commits with TID-based revisions
 - MST uses indigo's `atproto/repo/mst.Tree`
 - Commits use indigo's `atproto/repo.Commit` with secp256k1 signatures
+- Manager is stateless — receives tenant pool per operation
 
 ## Management API
 
 Namespaced as `host.primal.pds.*` following AT Protocol NSID convention.
 Authenticated via `Authorization: Bearer <adminKey>` header.
 
+- `addDomain` — creates domain row, tenant DB, pool, owner account, DID routing
+- `removeDomain` — deletes domain row, closes pool, drops tenant DB
+- `listAccounts` — requires `?domain=` parameter (queries tenant DB)
+- `createAccount` — inserts in tenant DB, adds DID routing row
+- `deleteAccount` — removes from tenant DB, deletes DID routing row
+
 ## AT Protocol Repo API
 
 Standard `com.atproto.repo.*` endpoints (admin auth for now):
 - `createRecord`, `getRecord`, `putRecord`, `deleteRecord`
 - `listRecords`, `describeRepo`
+
+Repo resolution uses DID routing table for DIDs, domain extraction for handles.
 
 ## Docker
 
