@@ -347,10 +347,10 @@ func (s *Server) handleDescribeRepo(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]any{
-		"handle":           acct.Handle,
-		"did":              acct.DID,
-		"didDoc":           map[string]any{},
-		"collections":      collections,
-		"handleIsCorrect":  true,
+		"handle":          acct.Handle,
+		"did":             acct.DID,
+		"didDoc":          map[string]any{},
+		"collections":     collections,
+		"handleIsCorrect": true,
 	})
 }

@@ -5,7 +5,6 @@ package database
 // Schema contains the SQL statements that create all tables needed by the
 // PDS. It uses CREATE TABLE IF NOT EXISTS so it is safe to run on every
 // startup — existing tables and data are preserved.
-//
 const Schema = `
 -- domains: Each row represents a domain hosted by this PDS instance.
 -- Accounts are created under a domain as <handle>.<domain>.

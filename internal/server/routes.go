@@ -87,7 +87,7 @@ type addDomainRequest struct {
 
 // addDomainResponse includes the domain and its auto-created owner account.
 type addDomainResponse struct {
-	Domain        *domain.Domain `json:"domain"`
+	Domain        *domain.Domain   `json:"domain"`
 	AdminAccount  *account.Account `json:"adminAccount"`
 	AdminPassword string           `json:"adminPassword"`
 }

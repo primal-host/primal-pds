@@ -27,9 +27,9 @@ import (
 
 // Sentinel errors for account operations.
 var (
-	ErrNotFound      = errors.New("account: not found")
-	ErrHandleTaken   = errors.New("account: handle already taken")
-	ErrEmailTaken    = errors.New("account: email already taken")
+	ErrNotFound       = errors.New("account: not found")
+	ErrHandleTaken    = errors.New("account: handle already taken")
+	ErrEmailTaken     = errors.New("account: email already taken")
 	ErrOwnerProtected = errors.New("account: owner account cannot be modified this way")
 )
 
