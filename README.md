@@ -79,12 +79,24 @@ All configuration is in `db.json`:
 
 ### Management (requires `Authorization: Bearer <adminKey>`)
 
+**Domains:**
+
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/xrpc/host.primal.pds.addDomain` | Add a hosted domain |
+| POST | `/xrpc/host.primal.pds.addDomain` | Add domain + auto-create owner account |
 | GET | `/xrpc/host.primal.pds.listDomains` | List all domains |
 | POST | `/xrpc/host.primal.pds.updateDomain` | Update domain status |
-| POST | `/xrpc/host.primal.pds.removeDomain` | Remove a domain |
+| POST | `/xrpc/host.primal.pds.removeDomain` | Remove domain (cascades accounts) |
+
+**Accounts:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/xrpc/host.primal.pds.createAccount` | Create account under a domain |
+| GET | `/xrpc/host.primal.pds.listAccounts` | List accounts (`?domain=...`) |
+| GET | `/xrpc/host.primal.pds.getAccount` | Get account (`?handle=...` or `?did=...`) |
+| POST | `/xrpc/host.primal.pds.updateAccount` | Change status/role |
+| POST | `/xrpc/host.primal.pds.deleteAccount` | Delete account |
 
 ## Infrastructure
 

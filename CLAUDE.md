@@ -26,6 +26,7 @@ go vet ./...
 - `internal/config/` — db.json config loading and validation
 - `internal/database/` — PostgreSQL connection pool and schema bootstrap
 - `internal/domain/` — Domain model, CRUD, and Traefik config generation
+- `internal/account/` — Account model, CRUD, DID generation, password hashing
 - `internal/server/` — Echo HTTP server, routes, and handlers
 
 ## Configuration
@@ -35,7 +36,15 @@ Loaded from `db.json` in the working directory. See `db.json.example`.
 ## Database
 
 PostgreSQL with pgx connection pool. Schema auto-created on startup
-using `CREATE TABLE IF NOT EXISTS`.
+using `CREATE TABLE IF NOT EXISTS`. Tables: `domains`, `accounts`.
+
+## Account Model
+
+- Roles: `owner` (domain admin, immutable), `admin`, `user`
+- Statuses: `active`, `suspended`, `disabled`, `removed`
+- Adding a domain auto-creates an owner account with generated password
+- Owner accounts cannot be demoted/deleted (remove domain instead)
+- Passwords: bcrypt hashed. DIDs: locally-generated did:plc format.
 
 ## Management API
 
