@@ -7,17 +7,50 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	"github.com/primal-host/primal-pds/internal/account"
 )
 
-// resolveRepo resolves a "repo" parameter (handle or DID) to an Account.
-func (s *Server) resolveRepo(c echo.Context, repoID string) (*account.Account, error) {
+// resolveRepo resolves a "repo" parameter (handle or DID) to an Account
+// and the tenant pool where that account lives.
+func (s *Server) resolveRepo(c echo.Context, repoID string) (*account.Account, *pgxpool.Pool, error) {
 	ctx := c.Request().Context()
+
+	var domainName string
+	var err error
+
 	if strings.HasPrefix(repoID, "did:") {
-		return s.accounts.GetByDID(ctx, repoID)
+		// Look up domain from DID routing table.
+		domainName, err = s.mgmtDB.LookupDIDDomain(ctx, repoID)
+		if err != nil {
+			return nil, nil, account.ErrNotFound
+		}
+	} else {
+		// Extract domain from handle suffix.
+		domainName = extractDomainFromHandle(repoID, s.pools)
+		if domainName == "" {
+			return nil, nil, account.ErrNotFound
+		}
 	}
-	return s.accounts.GetByHandle(ctx, repoID)
+
+	pool := s.pools.Get(domainName)
+	if pool == nil {
+		return nil, nil, account.ErrNotFound
+	}
+
+	accounts := s.tenantStore(pool)
+	var acct *account.Account
+	if strings.HasPrefix(repoID, "did:") {
+		acct, err = accounts.GetByDID(ctx, repoID)
+	} else {
+		acct, err = accounts.GetByHandle(ctx, repoID)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return acct, pool, nil
 }
 
 // repoNotFound returns a standard error response for missing repos.
@@ -53,7 +86,7 @@ func (s *Server) handleCreateRecord(c echo.Context) error {
 		})
 	}
 
-	acct, err := s.resolveRepo(c, req.Repo)
+	acct, pool, err := s.resolveRepo(c, req.Repo)
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			return repoNotFound(c, req.Repo)
@@ -69,9 +102,9 @@ func (s *Server) handleCreateRecord(c echo.Context) error {
 	var uri, cidStr, rev string
 
 	if req.RKey != "" {
-		uri, cidStr, rev, err = s.repos.PutRecord(ctx, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
+		uri, cidStr, rev, err = s.repos.PutRecord(ctx, pool, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
 	} else {
-		uri, cidStr, rev, err = s.repos.CreateRecord(ctx, acct.DID, acct.SigningKey, req.Collection, req.Record)
+		uri, cidStr, rev, err = s.repos.CreateRecord(ctx, pool, acct.DID, acct.SigningKey, req.Collection, req.Record)
 	}
 	if err != nil {
 		log.Printf("Error creating record for %s: %v", acct.DID, err)
@@ -105,7 +138,7 @@ func (s *Server) handleGetRecord(c echo.Context) error {
 		})
 	}
 
-	acct, err := s.resolveRepo(c, repoID)
+	acct, pool, err := s.resolveRepo(c, repoID)
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			return repoNotFound(c, repoID)
@@ -117,7 +150,7 @@ func (s *Server) handleGetRecord(c echo.Context) error {
 		})
 	}
 
-	cidStr, record, err := s.repos.GetRecord(c.Request().Context(), acct.DID, collection, rkey)
+	cidStr, record, err := s.repos.GetRecord(c.Request().Context(), pool, acct.DID, collection, rkey)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return c.JSON(http.StatusNotFound, map[string]string{
@@ -164,7 +197,7 @@ func (s *Server) handleDeleteRecord(c echo.Context) error {
 		})
 	}
 
-	acct, err := s.resolveRepo(c, req.Repo)
+	acct, pool, err := s.resolveRepo(c, req.Repo)
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			return repoNotFound(c, req.Repo)
@@ -176,7 +209,7 @@ func (s *Server) handleDeleteRecord(c echo.Context) error {
 		})
 	}
 
-	rev, err := s.repos.DeleteRecord(c.Request().Context(), acct.DID, acct.SigningKey, req.Collection, req.RKey)
+	rev, err := s.repos.DeleteRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return c.JSON(http.StatusNotFound, map[string]string{
@@ -192,7 +225,7 @@ func (s *Server) handleDeleteRecord(c echo.Context) error {
 	}
 
 	// Get updated commit CID.
-	commitCID, _, err := s.repos.GetRoot(c.Request().Context(), acct.DID)
+	commitCID, _, err := s.repos.GetRoot(c.Request().Context(), pool, acct.DID)
 	if err != nil {
 		commitCID = ""
 	}
@@ -230,7 +263,7 @@ func (s *Server) handlePutRecord(c echo.Context) error {
 		})
 	}
 
-	acct, err := s.resolveRepo(c, req.Repo)
+	acct, pool, err := s.resolveRepo(c, req.Repo)
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			return repoNotFound(c, req.Repo)
@@ -242,7 +275,7 @@ func (s *Server) handlePutRecord(c echo.Context) error {
 		})
 	}
 
-	uri, cidStr, rev, err := s.repos.PutRecord(c.Request().Context(), acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
+	uri, cidStr, rev, err := s.repos.PutRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
 	if err != nil {
 		log.Printf("Error putting record %s/%s for %s: %v", req.Collection, req.RKey, acct.DID, err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{
@@ -284,7 +317,7 @@ func (s *Server) handleListRecords(c echo.Context) error {
 	cursor := c.QueryParam("cursor")
 	reverse := c.QueryParam("reverse") == "true"
 
-	acct, err := s.resolveRepo(c, repoID)
+	acct, pool, err := s.resolveRepo(c, repoID)
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			return repoNotFound(c, repoID)
@@ -296,7 +329,7 @@ func (s *Server) handleListRecords(c echo.Context) error {
 		})
 	}
 
-	records, nextCursor, err := s.repos.ListRecords(c.Request().Context(), acct.DID, collection, limit, cursor, reverse)
+	records, nextCursor, err := s.repos.ListRecords(c.Request().Context(), pool, acct.DID, collection, limit, cursor, reverse)
 	if err != nil {
 		log.Printf("Error listing records for %s/%s: %v", acct.DID, collection, err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{
@@ -325,7 +358,7 @@ func (s *Server) handleDescribeRepo(c echo.Context) error {
 		})
 	}
 
-	acct, err := s.resolveRepo(c, repoID)
+	acct, pool, err := s.resolveRepo(c, repoID)
 	if err != nil {
 		if errors.Is(err, account.ErrNotFound) {
 			return repoNotFound(c, repoID)
@@ -337,7 +370,7 @@ func (s *Server) handleDescribeRepo(c echo.Context) error {
 		})
 	}
 
-	collections, err := s.repos.DescribeRepo(c.Request().Context(), acct.DID)
+	collections, err := s.repos.DescribeRepo(c.Request().Context(), pool, acct.DID)
 	if err != nil {
 		log.Printf("Error describing repo for %s: %v", acct.DID, err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{
