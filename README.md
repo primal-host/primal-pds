@@ -9,6 +9,8 @@ and management API.
   a single instance
 - **Management API** — XRPC-namespaced endpoints for domain and account
   management (no CLI required)
+- **AT Protocol Repositories** — Merkle Search Tree (MST) with signed commits,
+  content-addressed block storage, and standard repo XRPC endpoints
 - **Traefik integration** — Automatically generates dynamic routing config
   with wildcard TLS certificates
 - **PostgreSQL** — Centralized storage with auto-schema bootstrap on first run
@@ -54,6 +56,19 @@ and management API.
      -d '{"domain": "example.com"}'
    ```
 
+6. **Create a record**:
+
+   ```bash
+   curl -X POST http://localhost:3000/xrpc/com.atproto.repo.createRecord \
+     -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "repo": "example.com",
+       "collection": "app.bsky.feed.post",
+       "record": {"$type": "app.bsky.feed.post", "text": "Hello!", "createdAt": "2025-01-01T00:00:00Z"}
+     }'
+   ```
+
 ## Configuration
 
 All configuration is in `db.json`:
@@ -97,6 +112,17 @@ All configuration is in `db.json`:
 | GET | `/xrpc/host.primal.pds.getAccount` | Get account (`?handle=...` or `?did=...`) |
 | POST | `/xrpc/host.primal.pds.updateAccount` | Change status/role |
 | POST | `/xrpc/host.primal.pds.deleteAccount` | Delete account |
+
+**Repository:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/xrpc/com.atproto.repo.createRecord` | Create a record in a repo |
+| GET | `/xrpc/com.atproto.repo.getRecord` | Get a record by collection/rkey |
+| POST | `/xrpc/com.atproto.repo.putRecord` | Create or update a record |
+| POST | `/xrpc/com.atproto.repo.deleteRecord` | Delete a record |
+| GET | `/xrpc/com.atproto.repo.listRecords` | List records in a collection |
+| GET | `/xrpc/com.atproto.repo.describeRepo` | Describe repo collections |
 
 ## Infrastructure
 
