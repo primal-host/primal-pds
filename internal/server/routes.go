@@ -46,6 +46,7 @@ func (s *Server) registerRoutes() {
 	// --- Public sync endpoints (AT Protocol standard, no auth) ---
 	s.echo.GET("/xrpc/com.atproto.sync.getRepo", s.handleGetRepo)
 	s.echo.GET("/xrpc/com.atproto.sync.getLatestCommit", s.handleGetLatestCommit)
+	s.echo.GET("/xrpc/com.atproto.sync.subscribeRepos", s.handleSubscribeRepos)
 }
 
 // tenantStore creates an ephemeral account.Store backed by a tenant pool.
