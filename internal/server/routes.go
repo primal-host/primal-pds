@@ -70,7 +70,7 @@ func (s *Server) resolveDomainPool(c echo.Context, domainName string) (*pgxpool.
 // handleHealth returns basic server health information.
 func (s *Server) handleHealth(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{
-		"version": "0.4.0",
+		"version": "0.5.0",
 	})
 }
 
