@@ -44,6 +44,19 @@ type Config struct {
 	// When set, new accounts get proper did:plc DIDs derived from their
 	// signing key. When empty, random DIDs are generated (local-only).
 	PLCEndpoint string `json:"plcEndpoint,omitempty"`
+
+	// ServiceURL is the public URL of this PDS (e.g., "https://pds.primal.host").
+	// Used as JWT issuer and to derive did:web for describeServer.
+	ServiceURL string `json:"serviceURL,omitempty"`
+
+	// JWTSecret is the HMAC secret for signing JWT tokens. If empty, a
+	// random secret is generated on startup (tokens won't survive restart).
+	JWTSecret string `json:"jwtSecret,omitempty"`
+
+	// RegistrationOpen controls whether com.atproto.server.createAccount
+	// is open to the public. When false, only admin key holders can create
+	// accounts through the standard AT Protocol endpoint.
+	RegistrationOpen bool `json:"registrationOpen,omitempty"`
 }
 
 // Load reads and parses configuration from the given file path.
