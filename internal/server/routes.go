@@ -13,13 +13,46 @@ import (
 	"github.com/primal-host/primal-pds/internal/domain"
 )
 
-// registerRoutes sets up all HTTP routes.
+// registerRoutes sets up all HTTP routes with proper auth groupings.
 func (s *Server) registerRoutes() {
 	// --- Public endpoints (no auth) ---
 	s.echo.GET("/xrpc/_health", s.handleHealth)
 	s.echo.GET("/.well-known/atproto-did", s.handleAtprotoDID)
 
-	// --- Management API (admin auth required) ---
+	// AT Protocol server discovery
+	s.echo.POST("/xrpc/com.atproto.server.createSession", s.handleCreateSession)
+	s.echo.GET("/xrpc/com.atproto.server.describeServer", s.handleDescribeServer)
+
+	// AT Protocol identity
+	s.echo.GET("/xrpc/com.atproto.identity.resolveHandle", s.handleResolveHandle)
+
+	// AT Protocol public reads (no auth)
+	s.echo.GET("/xrpc/com.atproto.repo.getRecord", s.handleGetRecord)
+	s.echo.GET("/xrpc/com.atproto.repo.listRecords", s.handleListRecords)
+	s.echo.GET("/xrpc/com.atproto.repo.describeRepo", s.handleDescribeRepo)
+
+	// AT Protocol sync endpoints (public)
+	s.echo.GET("/xrpc/com.atproto.sync.getRepo", s.handleGetRepo)
+	s.echo.GET("/xrpc/com.atproto.sync.getLatestCommit", s.handleGetLatestCommit)
+	s.echo.GET("/xrpc/com.atproto.sync.subscribeRepos", s.handleSubscribeRepos)
+	s.echo.GET("/xrpc/com.atproto.sync.getBlob", s.handleGetBlob)
+	s.echo.POST("/xrpc/com.atproto.sync.requestCrawl", s.handleRequestCrawl)
+
+	// --- Refresh token auth ---
+	refresh := s.echo.Group("", s.requireRefresh)
+	refresh.POST("/xrpc/com.atproto.server.refreshSession", s.handleRefreshSession)
+	refresh.POST("/xrpc/com.atproto.server.deleteSession", s.handleDeleteSession)
+
+	// --- Access token or admin key (requireAuth) ---
+	authed := s.echo.Group("", s.requireAuth)
+	authed.GET("/xrpc/com.atproto.server.getSession", s.handleGetSession)
+	authed.POST("/xrpc/com.atproto.server.createAccount", s.handleCreateAccountXRPC)
+	authed.POST("/xrpc/com.atproto.repo.createRecord", s.handleCreateRecord)
+	authed.POST("/xrpc/com.atproto.repo.deleteRecord", s.handleDeleteRecord)
+	authed.POST("/xrpc/com.atproto.repo.putRecord", s.handlePutRecord)
+	authed.POST("/xrpc/com.atproto.repo.uploadBlob", s.handleUploadBlob)
+
+	// --- Admin key only (management API) ---
 	admin := s.echo.Group("", s.adminAuth)
 
 	// Domain management
@@ -34,19 +67,6 @@ func (s *Server) registerRoutes() {
 	admin.GET("/xrpc/host.primal.pds.getAccount", s.handleGetAccount)
 	admin.POST("/xrpc/host.primal.pds.updateAccount", s.handleUpdateAccount)
 	admin.POST("/xrpc/host.primal.pds.deleteAccount", s.handleDeleteAccount)
-
-	// AT Protocol repo operations
-	admin.POST("/xrpc/com.atproto.repo.createRecord", s.handleCreateRecord)
-	admin.GET("/xrpc/com.atproto.repo.getRecord", s.handleGetRecord)
-	admin.POST("/xrpc/com.atproto.repo.deleteRecord", s.handleDeleteRecord)
-	admin.POST("/xrpc/com.atproto.repo.putRecord", s.handlePutRecord)
-	admin.GET("/xrpc/com.atproto.repo.listRecords", s.handleListRecords)
-	admin.GET("/xrpc/com.atproto.repo.describeRepo", s.handleDescribeRepo)
-
-	// --- Public sync endpoints (AT Protocol standard, no auth) ---
-	s.echo.GET("/xrpc/com.atproto.sync.getRepo", s.handleGetRepo)
-	s.echo.GET("/xrpc/com.atproto.sync.getLatestCommit", s.handleGetLatestCommit)
-	s.echo.GET("/xrpc/com.atproto.sync.subscribeRepos", s.handleSubscribeRepos)
 }
 
 // tenantStore creates an ephemeral account.Store backed by a tenant pool.
@@ -70,7 +90,7 @@ func (s *Server) resolveDomainPool(c echo.Context, domainName string) (*pgxpool.
 // handleHealth returns basic server health information.
 func (s *Server) handleHealth(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{
-		"version": "0.5.0",
+		"version": "0.6.0",
 	})
 }
 
