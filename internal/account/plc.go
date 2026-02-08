@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/base64"
 	"fmt"
 	"strings"
 
@@ -78,7 +79,7 @@ func GeneratePLCDID(signingKeyMultibase, handle, serviceEndpoint string) (string
 	}
 
 	// DAG-CBOR encode the operation as a map with sorted keys.
-	cborBytes, err := cborEncodePLCOp(op)
+	cborBytes, err := CborEncodePLCOp(op)
 	if err != nil {
 		return "", nil, fmt.Errorf("plc: cbor encode: %w", err)
 	}
@@ -94,10 +95,10 @@ func GeneratePLCDID(signingKeyMultibase, handle, serviceEndpoint string) (string
 	return did, op, nil
 }
 
-// cborEncodePLCOp encodes a PLC operation as a CBOR map with sorted
+// CborEncodePLCOp encodes a PLC operation as a CBOR map with sorted
 // string keys, matching the canonical DAG-CBOR encoding used by the
 // PLC directory for DID derivation.
-func cborEncodePLCOp(op *PLCOperation) ([]byte, error) {
+func CborEncodePLCOp(op *PLCOperation) ([]byte, error) {
 	var buf bytes.Buffer
 	cw := cbg.NewCborWriter(&buf)
 
@@ -183,6 +184,27 @@ func cborEncodePLCOp(op *PLCOperation) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// SignPLCOperation signs a PLC genesis operation with the given private key
+// and returns the base64url-encoded signature (no padding).
+func SignPLCOperation(op *PLCOperation, signingKeyMultibase string) (string, error) {
+	cborBytes, err := CborEncodePLCOp(op)
+	if err != nil {
+		return "", fmt.Errorf("plc sign: cbor encode: %w", err)
+	}
+
+	privKey, err := repo.ParseKey(signingKeyMultibase)
+	if err != nil {
+		return "", fmt.Errorf("plc sign: parse key: %w", err)
+	}
+
+	sig, err := privKey.HashAndSign(cborBytes)
+	if err != nil {
+		return "", fmt.Errorf("plc sign: sign: %w", err)
+	}
+
+	return base64.RawURLEncoding.EncodeToString(sig), nil
 }
 
 // writeTextString writes a CBOR text string (major type 3).
