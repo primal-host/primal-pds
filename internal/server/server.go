@@ -7,9 +7,12 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/primal-host/primal-pds/internal/auth"
+	"github.com/primal-host/primal-pds/internal/blob"
 	"github.com/primal-host/primal-pds/internal/config"
 	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
@@ -26,10 +29,12 @@ type Server struct {
 	domains *domain.Store
 	repos   *repo.Manager
 	events  *events.Manager
+	jwt     *auth.JWTManager
+	blobs   *blob.Store
 }
 
 // New creates a configured Echo server with all routes registered.
-func New(cfg *config.Config, mgmtDB *database.ManagementDB, pools *database.PoolManager, domains *domain.Store, repos *repo.Manager, evts *events.Manager) *Server {
+func New(cfg *config.Config, mgmtDB *database.ManagementDB, pools *database.PoolManager, domains *domain.Store, repos *repo.Manager, evts *events.Manager, jwtMgr *auth.JWTManager) *Server {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true // We log the listen address ourselves.
@@ -45,10 +50,95 @@ func New(cfg *config.Config, mgmtDB *database.ManagementDB, pools *database.Pool
 		domains: domains,
 		repos:   repos,
 		events:  evts,
+		jwt:     jwtMgr,
+		blobs:   blob.NewStore(),
 	}
 
 	s.registerRoutes()
 	return s
+}
+
+// authContext holds the authenticated caller's identity.
+type authContext struct {
+	DID     string
+	IsAdmin bool
+}
+
+const authContextKey = "auth"
+
+// getAuth retrieves the auth context set by middleware.
+func getAuth(c echo.Context) *authContext {
+	if ac, ok := c.Get(authContextKey).(*authContext); ok {
+		return ac
+	}
+	return nil
+}
+
+// requireAuth is middleware that validates a Bearer token as either an
+// admin key or a JWT access token. Sets authContext on the request.
+func (s *Server) requireAuth(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		token := extractBearer(c)
+		if token == "" {
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"error":   "AuthRequired",
+				"message": "Authorization header with Bearer token is required",
+			})
+		}
+
+		// Try admin key first.
+		if token == s.cfg.AdminKey {
+			c.Set(authContextKey, &authContext{IsAdmin: true})
+			return next(c)
+		}
+
+		// Try JWT access token.
+		did, err := s.jwt.ValidateAccessToken(token)
+		if err != nil {
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"error":   "InvalidToken",
+				"message": "Invalid or expired access token",
+			})
+		}
+
+		c.Set(authContextKey, &authContext{DID: did})
+		return next(c)
+	}
+}
+
+// requireRefresh is middleware that validates a Bearer token as a JWT
+// refresh token. Sets authContext on the request.
+func (s *Server) requireRefresh(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		token := extractBearer(c)
+		if token == "" {
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"error":   "AuthRequired",
+				"message": "Authorization header with Bearer token is required",
+			})
+		}
+
+		did, err := s.jwt.ValidateRefreshToken(token)
+		if err != nil {
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"error":   "InvalidToken",
+				"message": "Invalid or expired refresh token",
+			})
+		}
+
+		c.Set(authContextKey, &authContext{DID: did})
+		return next(c)
+	}
+}
+
+// extractBearer extracts the Bearer token from the Authorization header.
+func extractBearer(c echo.Context) string {
+	h := c.Request().Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
+		return h[len(prefix):]
+	}
+	return ""
 }
 
 // Start begins listening for HTTP requests. It blocks until the context
