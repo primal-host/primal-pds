@@ -13,10 +13,11 @@ RUN CGO_ENABLED=0 go build -o primal-pds ./cmd/primal-pds
 # Runtime stage: minimal image with just the binary.
 FROM alpine:latest
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata curl
 
 WORKDIR /app
 COPY --from=builder /app/primal-pds .
+COPY smoke-test.sh .
 
 EXPOSE 3000
 
