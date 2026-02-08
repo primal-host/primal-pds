@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/primal-host/primal-pds/internal/account"
+	"github.com/primal-host/primal-pds/internal/identity"
 )
 
 // wsUpgrader allows any origin — the firehose is a public endpoint.
@@ -167,4 +169,33 @@ func (s *Server) handleSubscribeRepos(c echo.Context) error {
 			return nil
 		}
 	}
+}
+
+// handleRequestCrawl accepts a relay crawl request and optionally
+// forwards it to the configured relay. This endpoint exists so relays
+// and other services can tell us to re-announce ourselves.
+// POST /xrpc/com.atproto.sync.requestCrawl
+func (s *Server) handleRequestCrawl(c echo.Context) error {
+	var req struct {
+		Hostname string `json:"hostname"`
+	}
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error":   "InvalidRequest",
+			"message": "Invalid JSON body",
+		})
+	}
+
+	log.Printf("Crawl request received from: %s", req.Hostname)
+
+	// If we have a serviceURL, announce ourselves to the Bluesky relay.
+	if s.cfg.ServiceURL != "" {
+		go func() {
+			if err := identity.AnnounceToRelay(context.Background(), "https://bsky.network", s.cfg.ServiceURL); err != nil {
+				log.Printf("Warning: relay announcement failed: %v", err)
+			}
+		}()
+	}
+
+	return c.NoContent(http.StatusOK)
 }

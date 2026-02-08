@@ -25,6 +25,7 @@ import (
 	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
 	"github.com/primal-host/primal-pds/internal/events"
+	"github.com/primal-host/primal-pds/internal/identity"
 	"github.com/primal-host/primal-pds/internal/repo"
 	"github.com/primal-host/primal-pds/internal/server"
 )
@@ -128,6 +129,15 @@ func main() {
 	}
 	jwtMgr := auth.NewJWTManager(jwtSecret, cfg.ServiceURL)
 	log.Println("JWT manager initialized")
+
+	// Announce to Bluesky relay on startup.
+	if cfg.ServiceURL != "" {
+		go func() {
+			if err := identity.AnnounceToRelay(ctx, "https://bsky.network", cfg.ServiceURL); err != nil {
+				log.Printf("Warning: relay announcement failed: %v", err)
+			}
+		}()
+	}
 
 	// Start the HTTP server (blocks until context is cancelled).
 	srv := server.New(cfg, mgmtDB, pools, domains, repos, evtMgr, jwtMgr)
