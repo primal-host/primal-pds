@@ -104,6 +104,10 @@ func (s *Server) handleCreateRecord(c echo.Context) error {
 		})
 	}
 
+	if err := checkRepoAuth(c, acct.DID); err != nil {
+		return err
+	}
+
 	ctx := c.Request().Context()
 	var uri string
 	var result *repo.CommitResult
@@ -218,6 +222,10 @@ func (s *Server) handleDeleteRecord(c echo.Context) error {
 		})
 	}
 
+	if err := checkRepoAuth(c, acct.DID); err != nil {
+		return err
+	}
+
 	result, err := s.repos.DeleteRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -278,6 +286,10 @@ func (s *Server) handlePutRecord(c echo.Context) error {
 			"error":   "InternalError",
 			"message": "Failed to resolve repo",
 		})
+	}
+
+	if err := checkRepoAuth(c, acct.DID); err != nil {
+		return err
 	}
 
 	uri, result, err := s.repos.PutRecord(c.Request().Context(), pool, acct.DID, acct.SigningKey, req.Collection, req.RKey, req.Record)
@@ -411,6 +423,29 @@ func (s *Server) handleDescribeRepo(c echo.Context) error {
 		"collections":     collections,
 		"handleIsCorrect": true,
 	})
+}
+
+// checkRepoAuth verifies that the authenticated caller is allowed to
+// modify the given repo. Admins can modify any repo; JWT users can only
+// modify their own.
+func checkRepoAuth(c echo.Context, repoDID string) error {
+	ac := getAuth(c)
+	if ac == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{
+			"error":   "AuthRequired",
+			"message": "Authentication required",
+		})
+	}
+	if ac.IsAdmin {
+		return nil
+	}
+	if ac.DID != repoDID {
+		return c.JSON(http.StatusForbidden, map[string]string{
+			"error":   "Forbidden",
+			"message": "Cannot modify another account's repository",
+		})
+	}
+	return nil
 }
 
 // emitCommitEvent converts a CommitResult to a CommitInfo and emits it
