@@ -22,11 +22,14 @@ go vet ./...
 
 ## Project Structure
 
-- `cmd/primal-pds/main.go` — Entry point, wires config + db + events + server
+- `cmd/primal-pds/main.go` — Entry point, wires config + db + events + auth + server
 - `internal/config/` — db.json config loading and validation
 - `internal/database/` — Management DB, tenant pool manager, schema bootstrap
 - `internal/domain/` — Domain model, CRUD, and Traefik config generation
 - `internal/account/` — Account model, CRUD, DID generation, DID documents, PLC derivation
+- `internal/auth/` — JWT token management (HS256 access/refresh tokens)
+- `internal/blob/` — Content-addressed blob storage (images, media)
+- `internal/identity/` — PLC directory registration, relay announcement
 - `internal/repo/` — AT Protocol repository: MST, blockstore, CBOR, signing, CAR export
 - `internal/events/` — Firehose event manager: persistence, sequencing, fan-out
 - `internal/server/` — Echo HTTP server, routes, handlers, WebSocket firehose
@@ -38,6 +41,12 @@ Loaded from `db.json` in the working directory. See `db.json.example`.
 Optional fields:
 - `plcEndpoint` — PLC directory URL. When set, new accounts get proper
   `did:plc` identifiers derived from their signing key instead of random DIDs.
+- `serviceURL` — Public URL of this PDS (e.g., `https://pds.primal.host`).
+  Used as JWT issuer and for `did:web` in describeServer.
+- `jwtSecret` — HMAC secret for JWT signing. Auto-generated if empty (tokens
+  won't survive restart).
+- `registrationOpen` — When true, `com.atproto.server.createAccount` is open
+  to the public. When false (default), only admin key holders can create accounts.
 
 ## Database Architecture
 
@@ -52,6 +61,7 @@ Per-domain database isolation for multi-tenant PDS-as-a-service.
 - `accounts` — user accounts with signing keys (no domain_id FK)
 - `repo_blocks` — content-addressed CBOR blocks per account
 - `repo_roots` — current commit head per account repository
+- `blobs` — content-addressed media storage (images, etc.)
 
 Domain name → database name: `primal_pds_` + domain with dots→underscores.
 Example: `1440.news` → `primal_pds_1440_news`
@@ -71,6 +81,25 @@ ALTER ROLE dba_primal_pds CREATEDB;
 - DIDs: random `did:plc` by default; proper PLC derivation when `plcEndpoint` configured
 - Each account has a secp256k1 signing key (multibase-encoded)
 - DID documents built from signing key with Multikey verification method
+
+## Authentication
+
+Two auth mechanisms, used by different route groups:
+
+**Admin key** — `Authorization: Bearer <adminKey>` for management API.
+**JWT tokens** — HS256 signed, issued by `createSession` (login).
+- Access tokens: 2h TTL, scope `com.atproto.access`
+- Refresh tokens: 90d TTL, scope `com.atproto.refresh`
+- Stateless (no revocation table for MVP)
+
+**Route groups:**
+- Public: reads, discovery, createSession, sync, blobs
+- Refresh token: refreshSession, deleteSession
+- Access token or admin key: getSession, createAccount, repo writes, uploadBlob
+- Admin only: management API (host.primal.pds.*)
+
+**Repo authorization:** JWT users can only write to their own repo. Admins
+can write to any repo.
 
 ## Repository
 
@@ -100,10 +129,32 @@ AT Protocol sync layer for data export and real-time event streaming.
 - Slow consumers get disconnected (buffer overflow closes channel)
 - Wire format: `CBOR(EventHeader) + CBOR(SyncSubscribeRepos_Commit)`
 
+**Identity & Discovery:**
+- `resolveHandle` — handle → DID via XRPC endpoint
+- PLC directory registration — signs genesis ops, POSTs to plc.directory
+- Relay announcement — requestCrawl to bsky.network on startup
+- `describeServer` — returns `did:web`, available domains
+- `/.well-known/atproto-did` — handle resolution via Host header
+
+**Blob Support:**
+- Upload: `uploadBlob` (auth required, 1MB limit, SHA-256 CID)
+- Download: `getBlob` (public, by DID + CID)
+- Storage: per-tenant `blobs` table (BYTEA)
+
 **DID Documents:**
 - Built from account signing key + domain
 - Multikey verification method with secp256k1 public key
 - AtprotoPersonalDataServer service endpoint
+
+## AT Protocol Session API
+
+Standard `com.atproto.server.*` endpoints:
+- `createSession` — login with handle/DID + password, returns JWT pair
+- `refreshSession` — new token pair from refresh token
+- `getSession` — current session info + DID document
+- `deleteSession` — no-op (stateless MVP)
+- `describeServer` — service DID, available domains
+- `createAccount` — public account creation (gated by `registrationOpen`)
 
 ## Management API
 
@@ -118,9 +169,10 @@ Authenticated via `Authorization: Bearer <adminKey>` header.
 
 ## AT Protocol Repo API
 
-Standard `com.atproto.repo.*` endpoints (admin auth for now):
-- `createRecord`, `getRecord`, `putRecord`, `deleteRecord`
-- `listRecords`, `describeRepo` (now returns full DID document)
+Standard `com.atproto.repo.*` endpoints:
+- `createRecord`, `putRecord`, `deleteRecord` — auth required, per-account authorization
+- `getRecord`, `listRecords`, `describeRepo` — public reads
+- `uploadBlob` — auth required, 1MB limit
 
 Repo resolution uses DID routing table for DIDs, domain extraction for handles.
 
@@ -130,6 +182,8 @@ Public endpoints (no auth):
 - `com.atproto.sync.getRepo` — streams full repo as CAR v1
 - `com.atproto.sync.getLatestCommit` — returns `{cid, rev}`
 - `com.atproto.sync.subscribeRepos` — WebSocket firehose (CBOR frames)
+- `com.atproto.sync.getBlob` — retrieve blob by DID + CID
+- `com.atproto.sync.requestCrawl` — accept relay crawl requests
 
 ## Docker
 
