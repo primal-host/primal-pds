@@ -20,6 +20,7 @@ import (
 	"syscall"
 
 	"github.com/primal-host/primal-pds/internal/account"
+	"github.com/primal-host/primal-pds/internal/auth"
 	"github.com/primal-host/primal-pds/internal/config"
 	"github.com/primal-host/primal-pds/internal/database"
 	"github.com/primal-host/primal-pds/internal/domain"
@@ -119,8 +120,17 @@ func main() {
 	defer evtMgr.Shutdown()
 	log.Println("Event manager initialized")
 
+	// Initialize JWT manager for session auth.
+	jwtSecret := cfg.JWTSecret
+	if jwtSecret == "" {
+		jwtSecret = auth.GenerateSecret()
+		log.Println("WARNING: No jwtSecret in config, tokens won't survive restart")
+	}
+	jwtMgr := auth.NewJWTManager(jwtSecret, cfg.ServiceURL)
+	log.Println("JWT manager initialized")
+
 	// Start the HTTP server (blocks until context is cancelled).
-	srv := server.New(cfg, mgmtDB, pools, domains, repos, evtMgr)
+	srv := server.New(cfg, mgmtDB, pools, domains, repos, evtMgr, jwtMgr)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
