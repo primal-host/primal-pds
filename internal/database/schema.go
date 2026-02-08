@@ -88,4 +88,15 @@ CREATE TABLE IF NOT EXISTS repo_roots (
     rev         VARCHAR(50) NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- blobs: Content-addressed media storage for images and other binary data.
+CREATE TABLE IF NOT EXISTS blobs (
+    did        VARCHAR(255) NOT NULL,
+    cid        VARCHAR(255) NOT NULL,
+    mime_type  VARCHAR(255) NOT NULL,
+    size       BIGINT NOT NULL,
+    data       BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (did, cid)
+);
 `
